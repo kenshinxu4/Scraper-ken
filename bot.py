@@ -1,42 +1,56 @@
-# ╔══════════════════════════════════════════════════════════╗
-# ║         @KENSHIN_ANIME — AnimeDubHindi Telegram Bot      ║
-# ║         Made with Pyrofork | Real Scraping Engine        ║
-# ╚══════════════════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════╗
+# ║      @KENSHIN_ANIME — AnimeDubHindi Telegram Bot v2.0        ║
+# ║      Engine : Pyrofork | Cloudflare Bypass: curl_cffi        ║
+# ║      Scrapes: animedubhindi.me + links.animedubhindi.me      ║
+# ╚══════════════════════════════════════════════════════════════╝
 
 import asyncio
-import re
 import io
-import os
 import logging
+import os
+import re
+from functools import partial
 from urllib.parse import quote_plus, urljoin
 
-import aiohttp
 from bs4 import BeautifulSoup
-from pyrogram import Client, filters, enums
+from curl_cffi import requests as cf_req
+from pyrogram import Client, enums, filters
 from pyrogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 
-# ─── Logging ───────────────────────────────────────────────
+# ─── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("KenshinAnime")
 
-# ─── Config from env ───────────────────────────────────────
-API_ID       = int(os.environ["API_ID"])
-API_HASH     = os.environ["API_HASH"]
-BOT_TOKEN    = os.environ["BOT_TOKEN"]
-ADMIN_ID     = int(os.environ.get("ADMIN_ID", 0))
+# ─── Config ─────────────────────────────────────────────────────
+API_ID    = int(os.environ["API_ID"])
+API_HASH  = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID  = int(os.environ.get("ADMIN_ID", 0))
 
-# ─── Constants ─────────────────────────────────────────────
+# ─── Constants ──────────────────────────────────────────────────
 MAIN_SITE    = "https://www.animedubhindi.me"
 LINKS_SITE   = "https://links.animedubhindi.me"
 FILEPRESS    = "https://new2.filepress.wiki"
 CHANNEL_TAG  = "@KENSHIN_ANIME"
 
+# FilePress regex — matches all known variants
+FP_RE = re.compile(
+    r"https?://(?:[\w\-]+\.)*filepress\.(?:wiki|store|in|me)"
+    r"/(?:file|download|d)/([A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
+
+QUALITY_ORDER = {"360p": 0, "480p": 1, "720p": 2, "1080p": 3, "2160p": 4}
+
+# ─── Default caption ────────────────────────────────────────────
 DEFAULT_CAPTION = (
     "<b><blockquote>✨ {anime_name} ✨</blockquote>\n"
     "🌸 Episode : {ep} [S{season}]\n"
@@ -47,304 +61,502 @@ DEFAULT_CAPTION = (
     "━━━━━━━━━━━━━━━━━━━━━"
 )
 
-# ─── In-memory session stores ──────────────────────────────
-user_captions:   dict[int, str] = {}   # uid → caption template
-user_thumbnails: dict[int, bytes] = {} # uid → photo bytes
-user_state:      dict[int, dict] = {}  # uid → current session data
+# ─── In-memory stores ───────────────────────────────────────────
+user_captions:   dict[int, str]   = {}
+user_thumbnails: dict[int, bytes] = {}
+user_sessions:   dict[int, dict]  = {}
 
-QUALITIES = ["360p", "480p", "720p", "1080p", "2160p"]
+# ════════════════════════════════════════════════════════════════
+#  HTTP — curl_cffi (Cloudflare bypass via Chrome fingerprint)
+# ════════════════════════════════════════════════════════════════
 
-# ─── HTTP helpers ──────────────────────────────────────────
-HEADERS = {
+CF_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 
-async def fetch_html(url: str, session: aiohttp.ClientSession) -> str | None:
+# Shared curl_cffi session (thread-safe for executor)
+_cf_session = cf_req.Session(impersonate="chrome120")
+
+
+def _sync_get(url: str, stream: bool = False, timeout: int = 30):
+    """Synchronous GET with Chrome impersonation."""
     try:
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as r:
-            if r.status == 200:
-                return await r.text(errors="replace")
-            log.warning(f"HTTP {r.status} for {url}")
+        r = _cf_session.get(
+            url,
+            headers=CF_HEADERS,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        log.info(f"GET {url} → {r.status_code}")
+        return r
     except Exception as e:
-        log.error(f"fetch_html error {url}: {e}")
+        log.error(f"_sync_get error [{url}]: {e}")
+        return None
+
+
+async def async_get_html(url: str, timeout: int = 30) -> str | None:
+    """Async wrapper around sync curl_cffi GET. Returns HTML text or None."""
+    loop = asyncio.get_event_loop()
+    r = await loop.run_in_executor(None, partial(_sync_get, url, False, timeout))
+    if r is None:
+        return None
+    if r.status_code == 200:
+        return r.text
+    log.warning(f"HTTP {r.status_code} for {url}")
     return None
 
 
-# ─── 1. Search animedubhindi.me ────────────────────────────
+async def async_download_bytes(
+    url: str,
+    on_progress=None,
+    timeout: int = 3600,
+) -> io.BytesIO | None:
+    """
+    Download file bytes via curl_cffi (Cloudflare-safe).
+    Calls on_progress(done_bytes, total_bytes) periodically.
+    """
+    loop = asyncio.get_event_loop()
+
+    def _download():
+        try:
+            r = _cf_session.get(
+                url,
+                headers=CF_HEADERS,
+                timeout=timeout,
+                allow_redirects=True,
+                stream=True,
+            )
+            if r.status_code not in (200, 206):
+                log.error(f"Download HTTP {r.status_code}: {url}")
+                return None
+            total = int(r.headers.get("Content-Length", 0))
+            buf   = io.BytesIO()
+            done  = 0
+            for chunk in r.iter_content(chunk_size=524288):  # 512 KB
+                if chunk:
+                    buf.write(chunk)
+                    done += len(chunk)
+            buf.seek(0)
+            return buf, total
+        except Exception as e:
+            log.error(f"_download error: {e}")
+            return None
+
+    result = await loop.run_in_executor(None, _download)
+    if result is None:
+        return None
+    buf, total = result
+    if on_progress:
+        await on_progress(buf.getbuffer().nbytes, total or buf.getbuffer().nbytes)
+    return buf
+
+
+# ════════════════════════════════════════════════════════════════
+#  SCRAPER 1 — Search animedubhindi.me
+# ════════════════════════════════════════════════════════════════
+
 async def search_anime(query: str) -> list[dict]:
-    """
-    Returns list of {title, url, thumb} from site search.
-    """
-    url = f"{MAIN_SITE}/?s={quote_plus(query)}"
-    async with aiohttp.ClientSession() as s:
-        html = await fetch_html(url, s)
+    url  = f"{MAIN_SITE}/?s={quote_plus(query)}"
+    html = await async_get_html(url)
     if not html:
         return []
-    soup = BeautifulSoup(html, "lxml")
-    results = []
 
-    # WordPress typical article card selectors
-    for article in soup.select("article, .post, .item-post")[:8]:
-        a_tag = (
+    soup    = BeautifulSoup(html, "lxml")
+    results = []
+    seen    = set()
+
+    # Primary: article cards
+    for article in soup.select("article"):
+        a = (
             article.select_one("h2 a, h3 a, .entry-title a, .post-title a")
             or article.select_one("a[href]")
         )
-        if not a_tag:
+        if not a:
             continue
-        title = a_tag.get_text(strip=True)
-        href  = a_tag.get("href", "")
+        href  = a.get("href", "")
+        title = a.get_text(strip=True)
         if not href.startswith("http"):
             href = urljoin(MAIN_SITE, href)
-        # thumbnail
-        img = article.select_one("img")
-        thumb = ""
-        if img:
-            thumb = img.get("data-src") or img.get("src") or ""
-        if title and href and MAIN_SITE in href:
+        if MAIN_SITE in href and href not in seen and title:
+            seen.add(href)
+            # Thumbnail
+            img   = article.select_one("img[data-src], img[src]")
+            thumb = (img.get("data-src") or img.get("src", "")) if img else ""
             results.append({"title": title, "url": href, "thumb": thumb})
 
-    # De-duplicate by URL
-    seen = set()
-    unique = []
-    for r in results:
-        if r["url"] not in seen:
-            seen.add(r["url"])
-            unique.append(r)
-    return unique
+    # Fallback: all links that look like anime posts
+    if not results:
+        for a in soup.select("a[href]"):
+            href  = a.get("href", "")
+            title = a.get_text(strip=True)
+            if (
+                MAIN_SITE in href
+                and href not in seen
+                and len(title) > 10
+                and re.search(r"season|episode|hindi|multi", href, re.I)
+            ):
+                seen.add(href)
+                results.append({"title": title, "url": href, "thumb": ""})
+
+    return results[:8]
 
 
-# ─── 2. Extract download-page slug from anime page ─────────
+# ════════════════════════════════════════════════════════════════
+#  SCRAPER 2 — Anime post page → download page URL
+# ════════════════════════════════════════════════════════════════
+
 async def get_download_page_url(anime_url: str) -> str | None:
-    """
-    Fetches the anime post page, finds the links.animedubhindi.me episode URL.
-    Returns something like: https://links.animedubhindi.me/episode/jujutsu-kaisen-season-3/
-    """
-    async with aiohttp.ClientSession() as s:
-        html = await fetch_html(anime_url, s)
+    html = await async_get_html(anime_url)
     if not html:
         return None
+
     soup = BeautifulSoup(html, "lxml")
+
+    # Strategy 1: Direct link with links.animedubhindi.me/episode/
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "links.animedubhindi.me/episode/" in href:
-            return href.rstrip("/") + "/"
+            url = href.rstrip("/") + "/"
+            log.info(f"Found DL page (direct): {url}")
+            return url
+
+    # Strategy 2: Grep raw HTML
+    m = re.search(
+        r"https?://links\.animedubhindi\.me/episode/([\w\-]+)/?", html
+    )
+    if m:
+        url = f"{LINKS_SITE}/episode/{m.group(1)}/"
+        log.info(f"Found DL page (regex): {url}")
+        return url
+
+    # Strategy 3: Build from post slug by stripping noise
+    slug = anime_url.rstrip("/").split("/")[-1]
+    clean_slug = re.sub(
+        r"[-_](hindi|tamil|telugu|english|japanese|multi.?audio|"
+        r"dubbed|bluray|web.?dl|hd|fhd|cr.?dub|crunchyroll|"
+        r"episodes?.?download|free|from|animedubhindi|com|org|me)"
+        r".*$",
+        "",
+        slug,
+        flags=re.I,
+    ).strip("-_")
+
+    if clean_slug:
+        guessed = f"{LINKS_SITE}/episode/{clean_slug}/"
+        log.info(f"Guessing DL page: {guessed}")
+        # Verify it actually returns 200
+        test = await async_get_html(guessed)
+        if test and len(test) > 500:
+            return guessed
+
     return None
 
 
-# ─── 3. Scrape episode list + quality → FilePress IDs ──────
-def _parse_quality_from_text(text: str) -> str:
+# ════════════════════════════════════════════════════════════════
+#  SCRAPER 3 — links.animedubhindi.me/episode/{slug}/
+# ════════════════════════════════════════════════════════════════
+
+def _parse_quality(text: str) -> str:
     for q in ["2160p", "1080p", "720p", "480p", "360p"]:
         if q.lower() in text.lower():
             return q
     return "Unknown"
 
-def _parse_episode_from_text(text: str) -> str:
-    """Extract episode number from filename/text."""
-    # Patterns: S01E04, E04, Episode 4, Ep4, ep.04
-    m = re.search(r"[Ee][Pp]?[\.\s]?0*(\d+)", text)
-    if m:
-        return m.group(1).zfill(2)
-    m = re.search(r"[Ss]\d+[Ee]0*(\d+)", text)
-    if m:
-        return m.group(1).zfill(2)
-    m = re.search(r"(?:episode|ep)[\s\.\-_]?(\d+)", text, re.IGNORECASE)
-    if m:
-        return m.group(1).zfill(2)
+
+def _parse_episode(text: str) -> str:
+    # Patterns: S03E04, E04, ep04, episode 4, Episode-04
+    patterns = [
+        r"[Ss]\d{1,2}[Ee](\d{1,3})",        # S03E04
+        r"[Ee][Pp]?[\.\s\-_]?(\d{1,3})",    # E04 / EP04 / ep-04
+        r"[Ee]pisode[\s\.\-_]?(\d{1,3})",   # Episode 4
+        r"[\s\-_](\d{1,3})[\s\-_]",         # standalone number
+    ]
+    for p in patterns:
+        m = re.search(p, text)
+        if m:
+            return m.group(1).zfill(2)
     return "??"
 
-def _parse_season_from_text(text: str) -> str:
-    m = re.search(r"[Ss](?:eason)?[\s\.\-_]?0*(\d+)", text)
-    if m:
-        return m.group(1).zfill(2)
-    return "01"
 
-async def scrape_episodes(download_page_url: str) -> list[dict]:
-    """
-    Scrapes links.animedubhindi.me/episode/{slug}/
-    Returns list of:
-    {
-      ep: "01", season: "03", quality: "1080p",
-      filepress_id: "697b9d76bf879ec71ab5ac99",
-      filename: "[AnimeDubHindi] JJK S03E01 1080p.mkv",
-      label: "E01 — 1080p"
-    }
-    """
-    async with aiohttp.ClientSession() as s:
-        html = await fetch_html(download_page_url, s)
+def _parse_season(text: str) -> str:
+    m = re.search(r"[Ss](?:eason)?[\s\.\-_]?0*(\d{1,2})", text)
+    return m.group(1).zfill(2) if m else "01"
+
+
+async def scrape_episodes(dl_page_url: str) -> list[dict]:
+    html = await async_get_html(dl_page_url)
     if not html:
+        log.error(f"Empty HTML from {dl_page_url}")
         return []
+
+    log.info(f"DL page HTML length: {len(html)} chars")
     soup = BeautifulSoup(html, "lxml")
-    episodes = []
 
-    # FilePress links: new2.filepress.wiki/file/{id}
-    fp_pattern = re.compile(
-        r"https?://(?:new2|new|www)\.filepress\.wiki/(?:file|download)/([A-Za-z0-9]+)"
-    )
+    episodes_raw: list[dict] = []
 
-    # Each download row / table row / list item
-    # Try multiple selectors common on such sites
-    rows = (
-        soup.select("tr")                        # table rows
-        or soup.select(".entry-content p")        # paragraphs
-        or soup.select(".download-links a")
-        or soup.select("a[href*='filepress']")
-    )
+    # ── Strategy A: Find all <a> tags with filepress href ──────
+    fp_links = soup.find_all("a", href=FP_RE)
+    log.info(f"FilePress <a> tags found: {len(fp_links)}")
 
-    # Strategy: collect ALL filepress links with their surrounding text
-    all_links = soup.find_all("a", href=fp_pattern)
-    if not all_links:
-        # fallback: grep raw HTML
-        for m in fp_pattern.finditer(html):
-            fp_id = m.group(1)
-            # find context around match
-            start = max(0, m.start() - 200)
-            context = html[start: m.end() + 50]
-            ctxt_text = BeautifulSoup(context, "lxml").get_text(" ")
-            quality  = _parse_quality_from_text(ctxt_text)
-            ep_num   = _parse_episode_from_text(ctxt_text)
-            season   = _parse_season_from_text(ctxt_text)
-            episodes.append({
-                "ep": ep_num, "season": season, "quality": quality,
-                "filepress_id": fp_id,
-                "filename": f"[{CHANNEL_TAG}]E{ep_num}S{season}{quality}.mkv",
-                "label": f"E{ep_num} — {quality}"
-            })
-        return _dedup_episodes(episodes)
-
-    for a in all_links:
+    for a in fp_links:
         href = a.get("href", "")
-        m = fp_pattern.search(href)
+        m    = FP_RE.search(href)
         if not m:
             continue
         fp_id = m.group(1)
-        # Get surrounding text (parent row/div/td for context)
-        context_el = a.find_parent("tr") or a.find_parent("div") or a.find_parent("p") or a
-        ctx_text = context_el.get_text(" ", strip=True)
-        if not ctx_text:
-            ctx_text = a.get_text(" ", strip=True)
 
-        quality = _parse_quality_from_text(ctx_text)
-        ep_num  = _parse_episode_from_text(ctx_text)
-        season  = _parse_season_from_text(ctx_text)
+        # Get as much surrounding text as possible for context
+        ctx_parts = [a.get_text(" ", strip=True)]
 
-        episodes.append({
-            "ep": ep_num, "season": season, "quality": quality,
+        # Walk up parents to find more context
+        for parent in a.parents:
+            tag = parent.name
+            if tag in ("tr", "td", "li", "div", "p", "span", "section"):
+                ctx_parts.append(parent.get_text(" ", strip=True))
+                break
+            if tag in ("table", "ul", "ol", "article", "body"):
+                break
+
+        ctx = " ".join(ctx_parts)
+
+        quality = _parse_quality(ctx)
+        ep_num  = _parse_episode(ctx)
+        season  = _parse_season(ctx)
+
+        # Also try to parse from the href itself (filenames sometimes embedded)
+        if quality == "Unknown":
+            quality = _parse_quality(href)
+        if ep_num == "??":
+            ep_num = _parse_episode(href)
+        if season == "01":
+            s2 = _parse_season(href)
+            if s2 != "01":
+                season = s2
+
+        log.info(f"  EP {ep_num} S{season} {quality} → FP:{fp_id}")
+        episodes_raw.append({
+            "ep":          ep_num,
+            "season":      season,
+            "quality":     quality,
             "filepress_id": fp_id,
-            "filename": f"[{CHANNEL_TAG}]E{ep_num}S{season}{quality}.mkv",
-            "label": f"E{ep_num} — {quality}"
         })
 
-    return _dedup_episodes(episodes)
+    # ── Strategy B: Grep raw HTML for filepress URLs ────────────
+    if not episodes_raw:
+        log.info("Strategy A found nothing, trying raw HTML grep...")
+        for m in FP_RE.finditer(html):
+            fp_id = m.group(1)
+            # Grab surrounding context
+            start   = max(0, m.start() - 300)
+            end     = min(len(html), m.end() + 100)
+            ctx_raw = html[start:end]
+            ctx     = BeautifulSoup(ctx_raw, "lxml").get_text(" ")
+
+            quality = _parse_quality(ctx)
+            ep_num  = _parse_episode(ctx)
+            season  = _parse_season(ctx)
+
+            if quality == "Unknown":
+                quality = _parse_quality(m.group(0))
+            if ep_num == "??":
+                ep_num = _parse_episode(m.group(0))
+
+            log.info(f"  [grep] EP {ep_num} S{season} {quality} → FP:{fp_id}")
+            episodes_raw.append({
+                "ep":           ep_num,
+                "season":       season,
+                "quality":      quality,
+                "filepress_id": fp_id,
+            })
+
+    # ── Strategy C: data-id / data-file-id attributes ───────────
+    if not episodes_raw:
+        log.info("Strategy B found nothing, trying data-* attributes...")
+        for tag in soup.find_all(attrs={"data-id": True}):
+            val = tag.get("data-id", "")
+            if re.fullmatch(r"[A-Za-z0-9]{10,}", val):
+                ctx     = tag.get_text(" ", strip=True)
+                quality = _parse_quality(ctx)
+                ep_num  = _parse_episode(ctx)
+                season  = _parse_season(ctx)
+                episodes_raw.append({
+                    "ep": ep_num, "season": season,
+                    "quality": quality, "filepress_id": val,
+                })
+
+    if not episodes_raw:
+        log.error("All strategies failed — no FilePress links found!")
+        # Debug: print first 2000 chars of HTML
+        log.debug(f"Page HTML preview:\n{html[:2000]}")
+        return []
+
+    # ── Build final list ─────────────────────────────────────────
+    seen    = set()
+    final   = []
+    for ep in episodes_raw:
+        key = (ep["ep"], ep["quality"], ep["filepress_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        ep["filename"] = (
+            f"[{CHANNEL_TAG}]E{ep['ep']}S{ep['season']}{ep['quality']}.mkv"
+        )
+        ep["label"] = f"E{ep['ep']} — {ep['quality']}"
+        final.append(ep)
+
+    # Sort: episode asc, then quality
+    final.sort(
+        key=lambda x: (
+            int(x["ep"]) if x["ep"].isdigit() else 999,
+            QUALITY_ORDER.get(x["quality"], 5),
+        )
+    )
+    log.info(f"Total episodes scraped: {len(final)}")
+    return final
 
 
-def _dedup_episodes(eps: list[dict]) -> list[dict]:
-    seen = set()
-    out  = []
-    for e in eps:
-        key = (e["ep"], e["quality"], e["filepress_id"])
-        if key not in seen:
-            seen.add(key)
-            out.append(e)
-    # Sort by episode then quality
-    quality_order = {"360p": 0, "480p": 1, "720p": 2, "1080p": 3, "2160p": 4, "Unknown": 5}
-    out.sort(key=lambda x: (x["ep"], quality_order.get(x["quality"], 9)))
-    return out
+# ════════════════════════════════════════════════════════════════
+#  SCRAPER 4 — FilePress → real direct download URL
+# ════════════════════════════════════════════════════════════════
 
-
-# ─── 4. Resolve FilePress → direct download URL ────────────
 async def resolve_filepress(fp_id: str) -> tuple[str | None, str | None]:
     """
-    Returns (direct_download_url, filename)
-    Tries /file/{id} page, extracts real download link.
+    Returns (direct_download_url, filename).
+    Uses 7-strategy waterfall.
     """
     file_page = f"{FILEPRESS}/file/{fp_id}"
-    async with aiohttp.ClientSession() as s:
-        html = await fetch_html(file_page, s)
-        if not html:
-            return None, None
-        soup = BeautifulSoup(html, "lxml")
+    html = await async_get_html(file_page, timeout=20)
 
-        # Look for download button / direct link
-        dl_patterns = [
-            re.compile(r"https?://[^\"'>\s]+\.(?:mkv|mp4|avi|mov)[^\"'>\s]*", re.IGNORECASE),
-            re.compile(rf"https?://(?:new2|new)\.filepress\.wiki/download/([^\"'>\s]+)")
-        ]
+    if not html:
+        log.error(f"FilePress page empty for ID: {fp_id}")
+        return None, None
 
-        # Check <a> tags
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            for pat in dl_patterns:
-                if pat.search(href):
-                    filename = href.split("/")[-1].split("?")[0]
-                    return href, filename
+    soup = BeautifulSoup(html, "lxml")
 
-        # Check title for filename
-        title_tag = soup.find("title")
-        title_text = title_tag.get_text(strip=True) if title_tag else ""
-        # title is often the filename
-        fname_match = re.search(r"([\w\[\]\(\)\s\.\-]+\.(?:mkv|mp4))", title_text)
-        if fname_match:
-            raw_fname = fname_match.group(1).strip()
-            dl_url = f"{FILEPRESS}/download/{quote_plus(raw_fname)}"
-            return dl_url, raw_fname
+    # ── Strategy 1: Direct <a href> with .mkv/.mp4 ──────────────
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"\.(mkv|mp4|avi|mov|webm)(\?|$)", href, re.I):
+            fname = href.split("/")[-1].split("?")[0]
+            log.info(f"FP Strategy 1 (direct ext): {href}")
+            return href, fname
 
-        # Grep raw HTML for download links
-        for pat in dl_patterns:
-            m = pat.search(html)
-            if m:
-                href = m.group(0).strip("\"'")
-                filename = href.split("/")[-1].split("?")[0]
-                return href, filename
+    # ── Strategy 2: /download/ path ─────────────────────────────
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/download/" in href and "filepress" in href:
+            fname = href.split("/download/")[-1].split("?")[0]
+            log.info(f"FP Strategy 2 (/download/ path): {href}")
+            return href, fname
 
-        # Last resort: construct from ID
-        # Try fetching /download/{id} directly
-        dl_url = f"{FILEPRESS}/download/{fp_id}"
-        # Check if it redirects to actual file
+    # ── Strategy 3: Page <title> as filename ────────────────────
+    title_tag = soup.find("title")
+    if title_tag:
+        raw = title_tag.get_text(strip=True)
+        # Remove common site prefixes
+        for noise in ["FilePress -", "FilePress–", "Download -", "| FilePress"]:
+            raw = raw.replace(noise, "").strip()
+        fname_m = re.search(r"([\w\[\]\(\)\s\.\-]+\.(?:mkv|mp4))", raw, re.I)
+        if fname_m:
+            fname = fname_m.group(1).strip()
+            dl_url = f"{FILEPRESS}/download/{quote_plus(fname)}"
+            log.info(f"FP Strategy 3 (title): {dl_url}")
+            return dl_url, fname
+
+    # ── Strategy 4: JS variable with URL ────────────────────────
+    js_patterns = [
+        r"""(?:url|link|file|src)\s*[:=]\s*["']([^"']+\.(?:mkv|mp4)[^"']*)["']""",
+        r"""["'](https?://[^"']+\.(?:mkv|mp4)[^"']*)["']""",
+        r"""["'](https?://[^"']+/download/[^"']+)["']""",
+    ]
+    for pat in js_patterns:
+        jm = re.search(pat, html, re.IGNORECASE)
+        if jm:
+            href  = jm.group(1)
+            fname = href.split("/")[-1].split("?")[0]
+            log.info(f"FP Strategy 4 (JS var): {href}")
+            return href, fname
+
+    # ── Strategy 5: Raw HTML grep for download links ─────────────
+    for pat in [
+        r"https?://[^\s\"'<>]+\.mkv[^\s\"'<>]*",
+        r"https?://[^\s\"'<>]+\.mp4[^\s\"'<>]*",
+        r"https?://[^\s\"'<>]+/download/[^\s\"'<>]+",
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            href  = m.group(0).strip()
+            fname = href.split("/")[-1].split("?")[0]
+            log.info(f"FP Strategy 5 (raw grep): {href}")
+            return href, fname
+
+    # ── Strategy 6: HEAD request on /download/{id} ──────────────
+    loop = asyncio.get_event_loop()
+
+    def _head_check():
         try:
-            async with s.head(dl_url, headers=HEADERS,
-                               allow_redirects=True,
-                               timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status in (200, 206):
-                    final_url = str(r.url)
-                    filename = final_url.split("/")[-1].split("?")[0] or f"{fp_id}.mkv"
-                    return final_url, filename
-        except Exception:
-            pass
+            r = _cf_session.head(
+                f"{FILEPRESS}/download/{fp_id}",
+                headers=CF_HEADERS,
+                timeout=15,
+                allow_redirects=True,
+            )
+            if r.status_code in (200, 206):
+                final_url = str(r.url)
+                fname     = final_url.split("/")[-1].split("?")[0] or f"{fp_id}.mkv"
+                return final_url, fname
+        except Exception as e:
+            log.warning(f"HEAD check failed: {e}")
+        return None, None
 
+    dl_url, fname = await loop.run_in_executor(None, _head_check)
+    if dl_url:
+        log.info(f"FP Strategy 6 (HEAD redirect): {dl_url}")
+        return dl_url, fname
+
+    # ── Strategy 7: Try alternate FilePress endpoints ────────────
+    for alt_base in [
+        "https://filepress.wiki",
+        "https://new.filepress.wiki",
+        "https://filepress.store",
+    ]:
+        alt_url = f"{alt_base}/file/{fp_id}"
+        alt_html = await async_get_html(alt_url, timeout=15)
+        if alt_html:
+            m = re.search(
+                r"https?://[^\s\"'<>]+\.(?:mkv|mp4)[^\s\"'<>]*",
+                alt_html, re.I,
+            )
+            if m:
+                href  = m.group(0)
+                fname = href.split("/")[-1].split("?")[0]
+                log.info(f"FP Strategy 7 (alt endpoint {alt_base}): {href}")
+                return href, fname
+
+    log.error(f"All FilePress strategies failed for ID: {fp_id}")
     return None, None
 
 
-# ─── 5. Download bytes from URL ────────────────────────────
-async def download_file(url: str, progress_cb=None) -> io.BytesIO | None:
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=HEADERS,
-                              timeout=aiohttp.ClientTimeout(total=3600)) as r:
-                if r.status not in (200, 206):
-                    log.error(f"Download failed {r.status}: {url}")
-                    return None
-                total  = int(r.headers.get("Content-Length", 0))
-                buf    = io.BytesIO()
-                done   = 0
-                async for chunk in r.content.iter_chunked(1024 * 512):  # 512 KB chunks
-                    buf.write(chunk)
-                    done += len(chunk)
-                    if progress_cb and total:
-                        await progress_cb(done, total)
-                buf.seek(0)
-                return buf
-    except Exception as e:
-        log.error(f"download_file error: {e}")
-        return None
+# ════════════════════════════════════════════════════════════════
+#  PYROGRAM CLIENT
+# ════════════════════════════════════════════════════════════════
 
-
-# ─── Bot App ───────────────────────────────────────────────
 app = Client(
     "kenshin_anime_bot",
     api_id=API_ID,
@@ -353,112 +565,124 @@ app = Client(
 )
 
 
-# ─── /start ────────────────────────────────────────────────
+# ─── Helpers ────────────────────────────────────────────────────
+
+def get_caption(uid: int) -> str:
+    return user_captions.get(uid, DEFAULT_CAPTION)
+
+
+def clean_anime_name(raw: str) -> str:
+    return re.sub(
+        r"\s*[\|\-]\s*(hindi|tamil|telugu|english|japanese|multi.?audio"
+        r"|dubbed|bluray|web.?dl|episodes?\s*download.*)",
+        "",
+        raw,
+        flags=re.I,
+    ).strip()
+
+
+def build_kb(buttons: list[list]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(buttons)
+
+
+# ════════════════════════════════════════════════════════════════
+#  COMMANDS
+# ════════════════════════════════════════════════════════════════
+
 @app.on_message(filters.command("start"))
 async def cmd_start(_, msg: Message):
     await msg.reply_text(
-        "<b>🎌 Welcome to <a href='https://t.me/KENSHIN_ANIME'>@KENSHIN_ANIME</a> Anime Bot! 🎌</b>\n\n"
+        "<b>🔥 @KENSHIN_ANIME Anime Bot 🔥</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 <b>How to use:</b>\n"
-        "Just type any anime name and I'll search it for you!\n\n"
-        "🔍 <b>Example:</b>\n"
+        "🎌 <b>Hindi Dubbed Anime Download Bot!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📌 <b>Usage:</b> Just type any anime name:\n"
         "<code>Jujutsu Kaisen Season 3</code>\n"
         "<code>Attack on Titan Season 4</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 Use /help to see all commands.\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>🚀 Join ➜ @KENSHIN_ANIME for latest anime!</blockquote>",
+        "📋 Use /help for all commands.\n\n"
+        "<blockquote>🚀 Join ➜ @KENSHIN_ANIME</blockquote>",
         parse_mode=enums.ParseMode.HTML,
-        disable_web_page_preview=True
+        disable_web_page_preview=True,
     )
 
 
-# ─── /help ─────────────────────────────────────────────────
 @app.on_message(filters.command("help"))
 async def cmd_help(_, msg: Message):
     await msg.reply_text(
-        "<b>📖 @KENSHIN_ANIME Bot — Help Guide</b>\n\n"
+        "<b>📖 Help — @KENSHIN_ANIME Bot</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>🔍 Search Anime:</b>\n"
-        "Just type the anime name! No command needed.\n"
-        "<code>Jujutsu Kaisen Season 3</code>\n\n"
-        "<b>🎬 Then:</b>\n"
-        "1️⃣ Choose anime from search results\n"
-        "2️⃣ Choose episode(s) or all at once\n"
-        "3️⃣ Choose quality (360p/480p/720p/1080p/2160p)\n"
-        "4️⃣ Bot sends video directly! ✅\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🔍 Search:</b> Type anime name directly\n"
+        "<code>Naruto Shippuden Season 5</code>\n\n"
         "<b>⚙️ Commands:</b>\n"
-        "/start — Welcome message\n"
+        "/start — Welcome\n"
         "/help — This guide\n"
-        "/set_caption &lt;text&gt; — Set custom caption\n"
-        "   Variables: <code>{anime_name}</code> <code>{ep}</code> <code>{season}</code> <code>{quality}</code>\n"
-        "/get_caption — View your current caption\n"
-        "/reset_caption — Reset to default caption\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>🖼️ Set Thumbnail:</b>\n"
-        "Send any photo → it becomes your thumbnail!\n\n"
-        "<b>📦 File Name Format:</b>\n"
-        "<code>[@KENSHIN_ANIME]E01S03720p.mkv</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<blockquote>🚀 For More Join 🔰 @KENSHIN_ANIME</blockquote>",
-        parse_mode=enums.ParseMode.HTML
+        "/set_caption &lt;text&gt; — Custom caption\n"
+        "  Variables: {anime_name} {ep} {season} {quality}\n"
+        "/get_caption — View caption\n"
+        "/reset_caption — Reset caption\n\n"
+        "<b>🖼️ Thumbnail:</b> Send any photo to set thumbnail\n\n"
+        "<b>📦 Qualities:</b> 360p • 480p • 720p • 1080p • 2160p\n\n"
+        "<b>📥 Flow:</b>\n"
+        "1️⃣ Type name → 2️⃣ Select anime\n"
+        "3️⃣ Select episode → 4️⃣ Select quality\n"
+        "5️⃣ Bot sends video! ✅\n\n"
+        "<blockquote>🚀 Join ➜ @KENSHIN_ANIME</blockquote>",
+        parse_mode=enums.ParseMode.HTML,
     )
 
 
-# ─── /set_caption ──────────────────────────────────────────
 @app.on_message(filters.command("set_caption"))
 async def cmd_set_caption(_, msg: Message):
     uid  = msg.from_user.id
-    text = msg.text.split(None, 1)
-    if len(text) < 2:
+    args = msg.text.split(None, 1)
+    if len(args) < 2:
         await msg.reply_text(
-            "❌ Usage: <code>/set_caption Your caption here</code>\n\n"
-            "Available variables:\n"
-            "<code>{anime_name}</code> — Anime title\n"
-            "<code>{ep}</code> — Episode number\n"
-            "<code>{season}</code> — Season number\n"
-            "<code>{quality}</code> — Video quality",
-            parse_mode=enums.ParseMode.HTML
+            "❌ <b>Usage:</b> <code>/set_caption Your text here</code>\n\n"
+            "<b>Variables:</b> {anime_name} {ep} {season} {quality}",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
-    user_captions[uid] = text[1].strip()
-    await msg.reply_text("✅ Custom caption set successfully!", parse_mode=enums.ParseMode.HTML)
+    user_captions[uid] = args[1].strip()
+    await msg.reply_text("✅ Caption updated!", parse_mode=enums.ParseMode.HTML)
 
 
 @app.on_message(filters.command("get_caption"))
 async def cmd_get_caption(_, msg: Message):
     uid = msg.from_user.id
-    cap = user_captions.get(uid, DEFAULT_CAPTION)
+    cap = get_caption(uid)
     await msg.reply_text(
-        f"<b>📝 Your current caption:</b>\n<code>{cap}</code>",
-        parse_mode=enums.ParseMode.HTML
+        f"<b>📝 Current Caption:</b>\n<code>{cap}</code>",
+        parse_mode=enums.ParseMode.HTML,
     )
 
 
 @app.on_message(filters.command("reset_caption"))
 async def cmd_reset_caption(_, msg: Message):
-    uid = msg.from_user.id
-    user_captions.pop(uid, None)
+    user_captions.pop(msg.from_user.id, None)
     await msg.reply_text("✅ Caption reset to default!", parse_mode=enums.ParseMode.HTML)
 
 
-# ─── Photo → set as thumbnail ──────────────────────────────
+# ─── Photo → set thumbnail ──────────────────────────────────────
 @app.on_message(filters.photo & filters.private)
 async def handle_photo(_, msg: Message):
-    uid  = msg.from_user.id
-    photo = msg.photo
-    dl   = await msg.download(in_memory=True)
+    uid = msg.from_user.id
+    dl  = await msg.download(in_memory=True)
     dl.seek(0)
     user_thumbnails[uid] = dl.read()
     await msg.reply_text(
-        "✅ <b>Thumbnail set!</b>\nThis image will be used as thumbnail for all your future video uploads.",
-        parse_mode=enums.ParseMode.HTML
+        "🖼️ <b>Thumbnail set!</b> Used for all future uploads.",
+        parse_mode=enums.ParseMode.HTML,
     )
 
 
-# ─── Text message → Search ─────────────────────────────────
-@app.on_message(filters.text & filters.private & ~filters.command(["start","help","set_caption","get_caption","reset_caption"]))
+# ─── Text → search ─────────────────────────────────────────────
+@app.on_message(
+    filters.text
+    & filters.private
+    & ~filters.command(
+        ["start", "help", "set_caption", "get_caption", "reset_caption"]
+    )
+)
 async def handle_search(_, msg: Message):
     query = msg.text.strip()
     if not query:
@@ -466,451 +690,428 @@ async def handle_search(_, msg: Message):
     uid = msg.from_user.id
 
     wait = await msg.reply_text(
-        f"🔍 <b>Searching for:</b> <code>{query}</code>\n⏳ Please wait...",
-        parse_mode=enums.ParseMode.HTML
+        f"🔍 <b>Searching:</b> <code>{query}</code>...",
+        parse_mode=enums.ParseMode.HTML,
     )
 
     results = await search_anime(query)
-
     if not results:
         await wait.edit_text(
-            f"❌ No results found for <b>{query}</b>\n\n"
-            "Try a different spelling or shorter name.",
-            parse_mode=enums.ParseMode.HTML
+            f"❌ <b>No results found for:</b> <code>{query}</code>\n"
+            "Try a different search term.",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
-    # Store results in session
-    user_state[uid] = {"results": results, "query": query}
+    user_sessions[uid] = {"results": results, "query": query, "page": 0}
 
-    # Build inline keyboard
-    buttons = []
-    for i, r in enumerate(results):
-        short_title = r["title"][:50] + ("…" if len(r["title"]) > 50 else "")
-        buttons.append([InlineKeyboardButton(
-            f"🎬 {short_title}",
-            callback_data=f"anime_select|{uid}|{i}"
-        )])
+    buttons = [
+        [InlineKeyboardButton(
+            f"🎬 {r['title'][:50]}{'…' if len(r['title'])>50 else ''}",
+            callback_data=f"asel|{uid}|{i}",
+        )]
+        for i, r in enumerate(results)
+    ]
 
     await wait.edit_text(
-        f"🔍 <b>Results for:</b> <code>{query}</code>\n\n"
-        f"📋 Found <b>{len(results)}</b> result(s). Choose one:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode=enums.ParseMode.HTML
+        f"🎌 <b>Results for:</b> <i>{query}</i>\n"
+        f"📋 Found <b>{len(results)}</b> anime. Choose one:",
+        reply_markup=build_kb(buttons),
+        parse_mode=enums.ParseMode.HTML,
     )
 
 
-# ─── Callback: anime selected ──────────────────────────────
-@app.on_callback_query(filters.regex(r"^anime_select\|"))
-async def cb_anime_select(_, cq: CallbackQuery):
-    _, uid_str, idx_str = cq.data.split("|")
-    uid = int(uid_str)
-    if cq.from_user.id != uid:
-        await cq.answer("❌ This is not your session!", show_alert=True)
-        return
+# ════════════════════════════════════════════════════════════════
+#  CALLBACKS
+# ════════════════════════════════════════════════════════════════
 
-    idx     = int(idx_str)
-    results = user_state.get(uid, {}).get("results", [])
+# ─── Anime selected ────────────────────────────────────────────
+@app.on_callback_query(filters.regex(r"^asel\|(\d+)\|(\d+)$"))
+async def cb_anime_select(_, cq: CallbackQuery):
+    uid = int(cq.matches[0].group(1))
+    idx = int(cq.matches[0].group(2))
+    if cq.from_user.id != uid:
+        return await cq.answer("❌ Not your session!", show_alert=True)
+
+    sess = user_sessions.get(uid, {})
+    results = sess.get("results", [])
     if idx >= len(results):
-        await cq.answer("Session expired. Search again.", show_alert=True)
-        return
+        return await cq.answer("❌ Session expired.", show_alert=True)
 
     chosen = results[idx]
     await cq.answer()
     await cq.message.edit_text(
-        f"✅ <b>Selected:</b> {chosen['title']}\n\n"
-        f"🔗 Fetching episode list from website...\n⏳ Please wait...",
-        parse_mode=enums.ParseMode.HTML
+        f"⏳ <b>Fetching episodes for:</b>\n<i>{chosen['title']}</i>",
+        parse_mode=enums.ParseMode.HTML,
     )
 
-    # Fetch download page URL
-    dl_page_url = await get_download_page_url(chosen["url"])
-    if not dl_page_url:
+    dl_url = await get_download_page_url(chosen["url"])
+    if not dl_url:
         await cq.message.edit_text(
-            f"❌ Could not find download page for:\n<b>{chosen['title']}</b>\n\n"
-            "This anime may not have download links yet.",
-            parse_mode=enums.ParseMode.HTML
+            f"❌ <b>Download page not found!</b>\n"
+            f"Anime: <i>{chosen['title']}</i>\n\n"
+            "The website may not have download links for this anime yet.",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
-    # Scrape episodes
-    episodes = await scrape_episodes(dl_page_url)
+    await cq.message.edit_text(
+        f"⏳ <b>Scraping episode list...</b>\n"
+        f"<code>{dl_url}</code>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    episodes = await scrape_episodes(dl_url)
     if not episodes:
         await cq.message.edit_text(
-            f"❌ No episodes found for:\n<b>{chosen['title']}</b>",
-            parse_mode=enums.ParseMode.HTML
+            f"❌ <b>No episodes found!</b>\n"
+            f"Anime: <i>{chosen['title']}</i>\n\n"
+            f"🔗 Try manually: <a href='{dl_url}'>Open Download Page</a>",
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True,
         )
         return
 
-    # Save to session
-    user_state[uid]["chosen"]       = chosen
-    user_state[uid]["dl_page_url"]  = dl_page_url
-    user_state[uid]["episodes"]     = episodes
-    user_state[uid]["page"]         = 0
+    user_sessions[uid].update({
+        "chosen":   chosen,
+        "dl_url":   dl_url,
+        "episodes": episodes,
+        "page":     0,
+    })
 
-    await _show_episode_list(cq.message, uid, episodes, chosen["title"], page=0)
+    await _render_episode_page(cq.message, uid, episodes, chosen["title"], page=0)
 
 
-async def _show_episode_list(msg, uid: int, episodes: list[dict], anime_title: str, page: int = 0):
-    """Paginated episode list with quality buttons."""
+# ─── Episode page render ────────────────────────────────────────
+async def _render_episode_page(
+    msg, uid: int, episodes: list[dict], title: str, page: int
+):
     per_page = 8
-    total    = len(episodes)
     start    = page * per_page
-    end      = min(start + per_page, total)
-    page_eps = episodes[start:end]
+    end      = min(start + per_page, len(episodes))
+    chunk    = episodes[start:end]
+    total_p  = (len(episodes) - 1) // per_page + 1
 
     buttons = []
-
-    # Episode buttons
-    for i, ep in enumerate(page_eps):
-        real_idx = start + i
+    for i, ep in enumerate(chunk):
         buttons.append([InlineKeyboardButton(
             f"▶️ {ep['label']}",
-            callback_data=f"ep_select|{uid}|{real_idx}"
+            callback_data=f"epsel|{uid}|{start+i}",
         )])
 
-    # All Episodes button
+    # All on this page
     buttons.append([InlineKeyboardButton(
-        "📦 All Episodes (Current Page Quality)",
-        callback_data=f"ep_all|{uid}|{page}"
+        f"📦 All Episodes (Page {page+1})",
+        callback_data=f"epalp|{uid}|{page}",
     )])
 
     # Pagination
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"ep_page|{uid}|{page-1}"))
-    if end < total:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"ep_page|{uid}|{page+1}"))
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"eppg|{uid}|{page-1}"))
+    if end < len(episodes):
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"eppg|{uid}|{page+1}"))
     if nav:
         buttons.append(nav)
 
-    short_title = anime_title[:40] + ("…" if len(anime_title) > 40 else "")
+    short = title[:45] + ("…" if len(title) > 45 else "")
     await msg.edit_text(
-        f"🎌 <b>{short_title}</b>\n"
+        f"🎌 <b>{short}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 Total Episodes: <b>{total}</b> | Page {page+1}/{(total-1)//per_page+1}\n\n"
-        f"Choose an episode to download:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode=enums.ParseMode.HTML
+        f"📋 <b>{len(episodes)} episodes</b> found | Page {page+1}/{total_p}\n\n"
+        "Choose an episode:",
+        reply_markup=build_kb(buttons),
+        parse_mode=enums.ParseMode.HTML,
     )
 
 
-# ─── Callback: episode page navigation ─────────────────────
-@app.on_callback_query(filters.regex(r"^ep_page\|"))
+@app.on_callback_query(filters.regex(r"^eppg\|(\d+)\|(\d+)$"))
 async def cb_ep_page(_, cq: CallbackQuery):
-    _, uid_str, page_str = cq.data.split("|")
-    uid  = int(uid_str)
-    page = int(page_str)
+    uid  = int(cq.matches[0].group(1))
+    page = int(cq.matches[0].group(2))
     if cq.from_user.id != uid:
-        await cq.answer("❌ Not your session!", show_alert=True)
-        return
+        return await cq.answer("❌ Not your session!", show_alert=True)
     await cq.answer()
-    state    = user_state.get(uid, {})
-    episodes = state.get("episodes", [])
-    title    = state.get("chosen", {}).get("title", "Anime")
-    user_state[uid]["page"] = page
-    await _show_episode_list(cq.message, uid, episodes, title, page)
+    sess = user_sessions.get(uid, {})
+    user_sessions[uid]["page"] = page
+    await _render_episode_page(
+        cq.message, uid,
+        sess.get("episodes", []),
+        sess.get("chosen", {}).get("title", "Anime"),
+        page,
+    )
 
 
-# ─── Callback: single episode selected → quality choice ────
-@app.on_callback_query(filters.regex(r"^ep_select\|"))
+# ─── Episode selected → quality keyboard ───────────────────────
+@app.on_callback_query(filters.regex(r"^epsel\|(\d+)\|(\d+)$"))
 async def cb_ep_select(_, cq: CallbackQuery):
-    _, uid_str, idx_str = cq.data.split("|")
-    uid = int(uid_str)
-    idx = int(idx_str)
+    uid = int(cq.matches[0].group(1))
+    idx = int(cq.matches[0].group(2))
     if cq.from_user.id != uid:
-        await cq.answer("❌ Not your session!", show_alert=True)
-        return
+        return await cq.answer("❌ Not your session!", show_alert=True)
     await cq.answer()
 
-    state    = user_state.get(uid, {})
-    episodes = state.get("episodes", [])
+    sess     = user_sessions.get(uid, {})
+    episodes = sess.get("episodes", [])
     if idx >= len(episodes):
-        await cq.answer("Session expired!", show_alert=True)
-        return
+        return await cq.message.edit_text("❌ Session expired. Search again.")
 
     ep = episodes[idx]
-    user_state[uid]["selected_ep_idx"] = idx
-
     # Find all quality variants for this episode
-    ep_variants = [
+    variants = [
         (i, e) for i, e in enumerate(episodes)
         if e["ep"] == ep["ep"] and e["season"] == ep["season"]
     ]
+    user_sessions[uid]["sel_ep_idx"] = idx
 
-    buttons = []
-    for real_i, variant in ep_variants:
-        buttons.append([InlineKeyboardButton(
-            f"🎥 {variant['quality']}",
-            callback_data=f"dl_single|{uid}|{real_i}"
-        )])
-    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"ep_page|{uid}|{state.get('page',0)}")])
+    q_icons = {"360p":"📱","480p":"📺","720p":"🖥️","1080p":"🎬","2160p":"🔮","Unknown":"🎞️"}
+    buttons = [
+        [InlineKeyboardButton(
+            f"{q_icons.get(v['quality'],'🎞️')} {v['quality']}",
+            callback_data=f"dlsingle|{uid}|{vi}",
+        )]
+        for vi, v in variants
+    ]
+    page = sess.get("page", 0)
+    buttons.append([InlineKeyboardButton(
+        "🔙 Back", callback_data=f"eppg|{uid}|{page}",
+    )])
 
-    title = state.get("chosen", {}).get("title", "Anime")
+    title = sess.get("chosen", {}).get("title", "Anime")
     await cq.message.edit_text(
-        f"🎌 <b>{title}</b>\n"
+        f"🎌 <b>{title[:45]}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 <b>Episode {ep['ep']} — Season {ep['season']}</b>\n\n"
-        "Choose quality:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode=enums.ParseMode.HTML
+        "🎥 Choose quality:",
+        reply_markup=build_kb(buttons),
+        parse_mode=enums.ParseMode.HTML,
     )
 
 
-# ─── Callback: download single episode ─────────────────────
-@app.on_callback_query(filters.regex(r"^dl_single\|"))
+# ─── Single episode download ────────────────────────────────────
+@app.on_callback_query(filters.regex(r"^dlsingle\|(\d+)\|(\d+)$"))
 async def cb_dl_single(_, cq: CallbackQuery):
-    _, uid_str, idx_str = cq.data.split("|")
-    uid = int(uid_str)
-    idx = int(idx_str)
+    uid = int(cq.matches[0].group(1))
+    idx = int(cq.matches[0].group(2))
     if cq.from_user.id != uid:
-        await cq.answer("❌ Not your session!", show_alert=True)
-        return
-    await cq.answer("⏳ Fetching download link...")
+        return await cq.answer("❌ Not your session!", show_alert=True)
+    await cq.answer("⏳ Preparing download...")
 
-    state    = user_state.get(uid, {})
-    episodes = state.get("episodes", [])
+    sess     = user_sessions.get(uid, {})
+    episodes = sess.get("episodes", [])
     if idx >= len(episodes):
-        await cq.message.edit_text("❌ Session expired. Search again.")
-        return
+        return await cq.message.edit_text("❌ Session expired.")
 
     ep         = episodes[idx]
-    anime_name = state.get("chosen", {}).get("title", "Anime")
-    # Clean anime name (strip quality tags etc)
-    anime_name_clean = re.sub(r"\s*\(.*?\)|\s*\[.*?\]", "", anime_name).strip()
+    anime_name = clean_anime_name(sess.get("chosen", {}).get("title", "Anime"))
+
+    await _fetch_and_send(cq.message, uid, ep, anime_name)
+
+
+# ─── All episodes on page ──────────────────────────────────────
+@app.on_callback_query(filters.regex(r"^epalp\|(\d+)\|(\d+)$"))
+async def cb_ep_all_page(_, cq: CallbackQuery):
+    uid  = int(cq.matches[0].group(1))
+    page = int(cq.matches[0].group(2))
+    if cq.from_user.id != uid:
+        return await cq.answer("❌ Not your session!", show_alert=True)
+    await cq.answer()
+
+    sess     = user_sessions.get(uid, {})
+    episodes = sess.get("episodes", [])
+    title    = sess.get("chosen", {}).get("title", "Anime")
+
+    per_page = 8
+    start    = page * per_page
+    chunk    = episodes[start:start + per_page]
+
+    # Quality selection for bulk
+    avail_q = sorted(
+        set(e["quality"] for e in chunk),
+        key=lambda q: QUALITY_ORDER.get(q, 9),
+    )
+    q_icons = {"360p":"📱","480p":"📺","720p":"🖥️","1080p":"🎬","2160p":"🔮","Unknown":"🎞️"}
+    buttons = [
+        [InlineKeyboardButton(
+            f"{q_icons.get(q,'🎞️')} All — {q}",
+            callback_data=f"dlallq|{uid}|{page}|{q}",
+        )]
+        for q in avail_q
+    ]
+    buttons.append([InlineKeyboardButton(
+        "🔙 Back", callback_data=f"eppg|{uid}|{page}",
+    )])
 
     await cq.message.edit_text(
-        f"⏳ <b>Resolving download link...</b>\n"
+        f"📦 <b>All Episodes — Page {page+1}</b>\n"
+        f"🎌 {title[:45]}\n\n"
+        "Choose quality for bulk download:",
+        reply_markup=build_kb(buttons),
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@app.on_callback_query(filters.regex(r"^dlallq\|(\d+)\|(\d+)\|(.+)$"))
+async def cb_dl_all_quality(_, cq: CallbackQuery):
+    uid     = int(cq.matches[0].group(1))
+    page    = int(cq.matches[0].group(2))
+    quality = cq.matches[0].group(3)
+    if cq.from_user.id != uid:
+        return await cq.answer("❌ Not your session!", show_alert=True)
+    await cq.answer(f"📦 Starting bulk — {quality}")
+
+    sess       = user_sessions.get(uid, {})
+    episodes   = sess.get("episodes", [])
+    title      = sess.get("chosen", {}).get("title", "Anime")
+    anime_name = clean_anime_name(title)
+
+    per_page = 8
+    start    = page * per_page
+    chunk    = [
+        e for e in episodes[start:start + per_page]
+        if e["quality"] == quality
+    ]
+
+    if not chunk:
+        return await cq.message.edit_text(
+            f"❌ No episodes with quality {quality} on this page."
+        )
+
+    await cq.message.edit_text(
+        f"📦 <b>Bulk Download Started!</b>\n"
+        f"🎌 {title[:45]}\n"
+        f"🎥 {quality} | 📋 {len(chunk)} episodes\n\n"
+        "Sending one by one... ⏳",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    for ep in chunk:
+        await _fetch_and_send(cq.message, uid, ep, anime_name, reply=False)
+        await asyncio.sleep(3)
+
+    await cq.message.reply_text(
+        f"✅ <b>All {len(chunk)} episodes sent!</b>\n\n"
+        "<blockquote>🚀 For More Join 🔰 @KENSHIN_ANIME</blockquote>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+# ════════════════════════════════════════════════════════════════
+#  CORE — Fetch & Send
+# ════════════════════════════════════════════════════════════════
+
+async def _fetch_and_send(
+    msg: Message,
+    uid: int,
+    ep: dict,
+    anime_name: str,
+    reply: bool = True,
+):
+    status = await msg.reply_text(
+        f"🔗 <b>Resolving download link...</b>\n"
         f"📌 Episode {ep['ep']} | {ep['quality']}",
-        parse_mode=enums.ParseMode.HTML
+        parse_mode=enums.ParseMode.HTML,
     )
 
     dl_url, filename = await resolve_filepress(ep["filepress_id"])
     if not dl_url:
-        await cq.message.edit_text(
-            f"❌ <b>Failed to resolve download link!</b>\n"
-            f"FilePress ID: <code>{ep['filepress_id']}</code>\n\n"
-            "The file may have been removed or the link expired.",
-            parse_mode=enums.ParseMode.HTML
+        await status.edit_text(
+            f"❌ <b>Link resolve failed!</b>\n"
+            f"Episode {ep['ep']} | {ep['quality']}\n"
+            f"FilePress ID: <code>{ep['filepress_id']}</code>",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
-    # Final filename override
-    bot_filename = ep["filename"]
-
-    # Build caption
-    cap_template = user_captions.get(uid, DEFAULT_CAPTION)
-    caption = cap_template.format(
-        anime_name=anime_name_clean,
-        ep=ep["ep"],
-        season=ep["season"],
-        quality=ep["quality"]
-    )
-
-    await _download_and_send(cq.message, uid, dl_url, bot_filename, caption, ep)
-
-
-# ─── Callback: all episodes (page) ─────────────────────────
-@app.on_callback_query(filters.regex(r"^ep_all\|"))
-async def cb_ep_all(_, cq: CallbackQuery):
-    _, uid_str, page_str = cq.data.split("|")
-    uid  = int(uid_str)
-    page = int(page_str)
-    if cq.from_user.id != uid:
-        await cq.answer("❌ Not your session!", show_alert=True)
-        return
-    await cq.answer()
-
-    state    = user_state.get(uid, {})
-    episodes = state.get("episodes", [])
-    title    = state.get("chosen", {}).get("title", "Anime")
-
-    # Get unique episodes on this page (first quality variant)
-    per_page = 8
-    start    = page * per_page
-    end      = min(start + per_page, len(episodes))
-    page_eps = episodes[start:end]
-
-    # Show quality selection for bulk download
-    # Use the qualities available across these episodes
-    available_qualities = sorted(
-        set(e["quality"] for e in page_eps),
-        key=lambda q: ["360p","480p","720p","1080p","2160p","Unknown"].index(q)
-        if q in ["360p","480p","720p","1080p","2160p","Unknown"] else 9
-    )
-
-    buttons = [[InlineKeyboardButton(
-        f"📦 All — {q}",
-        callback_data=f"dl_all_quality|{uid}|{page}|{q}"
-    )] for q in available_qualities]
-    buttons.append([InlineKeyboardButton(
-        "🔙 Back",
-        callback_data=f"ep_page|{uid}|{page}"
-    )])
-
-    await cq.message.edit_text(
-        f"📦 <b>Download All Episodes (Page {page+1})</b>\n"
-        f"🎌 {title}\n\n"
-        "Choose quality for bulk download:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode=enums.ParseMode.HTML
-    )
-
-
-@app.on_callback_query(filters.regex(r"^dl_all_quality\|"))
-async def cb_dl_all_quality(_, cq: CallbackQuery):
-    parts   = cq.data.split("|")
-    uid     = int(parts[1])
-    page    = int(parts[2])
-    quality = parts[3]
-    if cq.from_user.id != uid:
-        await cq.answer("❌ Not your session!", show_alert=True)
-        return
-    await cq.answer(f"⏳ Starting bulk download — {quality}")
-
-    state    = user_state.get(uid, {})
-    episodes = state.get("episodes", [])
-    title    = state.get("chosen", {}).get("title", "Anime")
-    anime_name_clean = re.sub(r"\s*\(.*?\)|\s*\[.*?\]", "", title).strip()
-
-    per_page = 8
-    start    = page * per_page
-    end      = min(start + per_page, len(episodes))
-    page_eps = [e for e in episodes[start:end] if e["quality"] == quality]
-
-    if not page_eps:
-        await cq.message.edit_text(f"❌ No episodes found for quality: {quality}")
-        return
-
-    await cq.message.edit_text(
-        f"📦 <b>Bulk Download Started!</b>\n"
-        f"🎌 {title}\n"
-        f"🎥 Quality: {quality}\n"
-        f"📋 Episodes: {len(page_eps)}\n\n"
-        f"⏳ Sending one by one...",
-        parse_mode=enums.ParseMode.HTML
-    )
-
-    for ep in page_eps:
-        cap_template = user_captions.get(uid, DEFAULT_CAPTION)
-        caption = cap_template.format(
-            anime_name=anime_name_clean,
-            ep=ep["ep"],
-            season=ep["season"],
-            quality=ep["quality"]
-        )
-        dl_url, _ = await resolve_filepress(ep["filepress_id"])
-        if not dl_url:
-            await cq.message.reply_text(
-                f"❌ Episode {ep['ep']} — Link expired/not found.",
-                parse_mode=enums.ParseMode.HTML
-            )
-            continue
-        await _download_and_send(
-            cq.message, uid, dl_url, ep["filename"], caption, ep, reply=False
-        )
-        await asyncio.sleep(2)  # Flood control
-
-    await cq.message.reply_text(
-        f"✅ <b>All {len(page_eps)} episodes sent!</b>\n\n"
-        f"<blockquote>🚀 For More Join 🔰 @KENSHIN_ANIME</blockquote>",
-        parse_mode=enums.ParseMode.HTML
-    )
-
-
-# ─── Core: download from URL and send video ────────────────
-async def _download_and_send(
-    msg: Message,
-    uid: int,
-    dl_url: str,
-    filename: str,
-    caption: str,
-    ep: dict,
-    reply: bool = True
-):
-    # Status message
-    status_msg = await msg.reply_text(
+    await status.edit_text(
         f"⬇️ <b>Downloading...</b>\n"
-        f"📌 Episode {ep['ep']} | {ep['quality']}\n"
-        f"🔗 <code>{dl_url[:60]}...</code>",
-        parse_mode=enums.ParseMode.HTML
-    ) if reply else msg
+        f"📌 Episode {ep['ep']} | {ep['quality']}",
+        parse_mode=enums.ParseMode.HTML,
+    )
 
-    last_update = [0.0]
+    last_edit = [0.0]
 
-    async def progress(done: int, total: int):
+    async def on_progress(done: int, total: int):
         now = asyncio.get_event_loop().time()
-        if now - last_update[0] < 3:
+        if now - last_edit[0] < 4:
             return
-        last_update[0] = now
-        pct  = done * 100 // total
-        mb_d = done / 1024 / 1024
-        mb_t = total / 1024 / 1024
-        bar  = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        last_edit[0] = now
+        pct    = (done * 100 // total) if total else 0
+        done_m = done / 1048576
+        tot_m  = total / 1048576 if total else 0
+        bar    = "█" * (pct // 10) + "░" * (10 - pct // 10)
         try:
-            await status_msg.edit_text(
+            await status.edit_text(
                 f"⬇️ <b>Downloading:</b> {pct}%\n"
                 f"[{bar}]\n"
-                f"📦 {mb_d:.1f} MB / {mb_t:.1f} MB\n"
+                f"📦 {done_m:.1f} MB / {tot_m:.1f} MB\n"
                 f"📌 Episode {ep['ep']} | {ep['quality']}",
-                parse_mode=enums.ParseMode.HTML
+                parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
             pass
 
-    video_bytes = await download_file(dl_url, progress_cb=progress)
-
-    if not video_bytes:
-        await status_msg.edit_text(
+    buf = await async_download_bytes(dl_url, on_progress=on_progress)
+    if not buf:
+        await status.edit_text(
             f"❌ <b>Download failed!</b>\n"
-            f"Could not download Episode {ep['ep']}.\n"
-            f"URL: <code>{dl_url[:80]}</code>",
-            parse_mode=enums.ParseMode.HTML
+            f"Episode {ep['ep']} | URL: <code>{dl_url[:80]}</code>",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
-    try:
-        await status_msg.edit_text(
-            f"📤 <b>Uploading to Telegram...</b>\n"
-            f"📌 Episode {ep['ep']} | {ep['quality']}",
-            parse_mode=enums.ParseMode.HTML
-        )
-    except Exception:
-        pass
+    await status.edit_text(
+        f"📤 <b>Uploading to Telegram...</b>\n"
+        f"📌 Episode {ep['ep']} | {ep['quality']}",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    # Build caption
+    cap_template = get_caption(uid)
+    season       = ep.get("season", "01")
+    caption      = cap_template.format(
+        anime_name=anime_name,
+        ep=ep["ep"],
+        season=season,
+        quality=ep["quality"],
+    )
+
+    # Filename
+    bot_filename = ep["filename"]
+    buf.name     = bot_filename
 
     # Thumbnail
     thumb = None
-    thumb_bytes = user_thumbnails.get(uid)
-    if thumb_bytes:
-        thumb = io.BytesIO(thumb_bytes)
-        thumb.name = "thumb.jpg"
-
-    # Rename BytesIO
-    video_bytes.name = filename
+    if uid in user_thumbnails:
+        tb     = io.BytesIO(user_thumbnails[uid])
+        tb.name = "thumb.jpg"
+        thumb  = tb
 
     try:
-        sent = await msg.reply_video(
-            video=video_bytes,
+        await msg.reply_video(
+            video=buf,
             caption=caption,
             parse_mode=enums.ParseMode.HTML,
-            file_name=filename,
+            file_name=bot_filename,
             thumb=thumb,
             supports_streaming=True,
         )
-        # Delete status message after successful send
         try:
-            await status_msg.delete()
+            await status.delete()
         except Exception:
             pass
     except Exception as e:
-        log.error(f"Send video error: {e}")
-        await status_msg.edit_text(
+        log.error(f"Upload error: {e}")
+        await status.edit_text(
             f"❌ <b>Upload failed!</b>\n<code>{str(e)[:200]}</code>",
-            parse_mode=enums.ParseMode.HTML
+            parse_mode=enums.ParseMode.HTML,
         )
 
 
-# ─── Run ───────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  RUN
+# ════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    log.info("🚀 @KENSHIN_ANIME Bot starting...")
+    log.info("🚀 @KENSHIN_ANIME Bot starting (v2.0 — Cloudflare bypass)...")
     app.run()
