@@ -1,4 +1,5 @@
 pyrofork
+tgcrypto
 aiohttp
 beautifulsoup4
 fake-useragent
