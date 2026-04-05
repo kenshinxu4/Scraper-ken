@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""KENSHIN ANIME BOT — Real-time anime scraper for animedubhindi.me (PyroFork)"""
+"""KENSHIN ANIME BOT — Real-time anime scraper for animedubhindi.me (PyroGram)"""
 
-import asyncio, re, os, json, traceback
+import asyncio, re, os
 from io import BytesIO
-from urllib.parse import quote_plus, urljoin
-from pyrofork import Client, filters
-from pyrofork.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaDocument, InputMediaPhoto
+from urllib.parse import quote_plus
+from pyrogram import Client, filters
+from pyrogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
@@ -30,7 +29,7 @@ DEF_CAP = (
     "━━━━━━━━━━━━━━━━━━━━━"
 )
 
-# ─── PyroFork Client ─────────────────────────────────────
+# ─── PyroGram Client ─────────────────────────────────────
 if SESSION:
     bot = Client(
         "kenshin_bot",
@@ -89,7 +88,6 @@ async def _get(url, session, retries=3):
 
 
 async def search_anime(query, session):
-    """Search animedubhindi.me — returns [(title, url), ...]"""
     html = await _get(
         f"https://animedubhindi.me/?s={quote_plus(query)}", session
     )
@@ -119,21 +117,18 @@ async def search_anime(query, session):
 
 
 async def get_episodes(anime_url, session):
-    """Scrape episode links from anime page — returns [(ep_title, links_url), ...]"""
     html = await _get(anime_url, session)
     if not html:
         return []
     soup = BeautifulSoup(html, "html.parser")
     episodes = []
     seen = set()
-    # Primary: links to links.animedubhindi.me
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         text = a.get_text(strip=True)
         if ("links.animedubhindi.me" in href or "/episode/" in href) and href not in seen and text:
             seen.add(href)
             episodes.append((text, href))
-    # Secondary: any episode-like links
     if not episodes:
         for a in soup.select("a[href]"):
             href = a.get("href", "")
@@ -144,7 +139,6 @@ async def get_episodes(anime_url, session):
             ):
                 seen.add(href)
                 episodes.append((text, href))
-    # Tertiary: page source regex for links.animedubhindi.me
     if not episodes:
         for match in re.finditer(r'href=["\'](https?://links\.animedubhindi\.me/[^"\']+)["\']', html):
             url = match.group(1)
@@ -157,7 +151,6 @@ async def get_episodes(anime_url, session):
 
 
 async def get_qualities(links_page_url, session):
-    """Scrape quality links from links.animedubhindi.me — returns [(quality, filepress_url), ...]"""
     html = await _get(links_page_url, session)
     if not html:
         return []
@@ -181,7 +174,6 @@ async def get_qualities(links_page_url, session):
                 if "unknown" not in found:
                     found["unknown"] = href
 
-    # Also regex search in raw HTML for filepress URLs with quality
     for match in re.finditer(r'(https?://[^\s"\']+?filepress[^\s"\']+)', html, re.I):
         url = match.group(1)
         if url not in seen:
@@ -202,7 +194,6 @@ async def get_qualities(links_page_url, session):
 
 
 async def resolve_filepress(fp_url, session):
-    """Resolve FilePress page → direct download URL"""
     headers = {
         "User-Agent": ua.random,
         "Referer": fp_url,
@@ -232,7 +223,6 @@ async def resolve_filepress(fp_url, session):
             if redir:
                 return redir.group(1)
 
-            # Check meta refresh
             meta = re.search(r'content=["\']\d+;\s*url=(.*?)["\']', text, re.I)
             if meta:
                 return meta.group(1)
@@ -264,7 +254,7 @@ async def start_cmd(c, m):
         f"  /remove_thumb — Remove thumbnail\n"
         f"  /report — Report issue to admin\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>🚀 {OWNER_USERNAME}</blockquote>",
+        f"<blockquote>🚀 For More Join 🔰 {OWNER_USERNAME}</blockquote>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔎 Search Anime", callback_data="search_start")],
             [InlineKeyboardButton("📢 Channel", url=f"https://t.me/{OWNER_USERNAME.replace('@','')}")]
@@ -293,7 +283,7 @@ async def help_cmd(c, m):
         "  /remove_thumb — Remove thumbnail\n"
         "  /report &lt;msg&gt; — Report to admin\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<blockquote>🚀 {OWNER_USERNAME}</blockquote>",
+        f"<blockquote>🚀 For More Join 🔰 {OWNER_USERNAME}</blockquote>",
         disable_web_page_preview=True
     )
 
@@ -587,7 +577,6 @@ async def cb_select_ep(c, q):
         return
 
     user_states[uid]["data"]["qualities"] = qualities
-    # Store first ep's qualities as reference for "ALL"
     user_states[uid]["data"]["ref_qualities"] = qualities
 
     btns = []
@@ -640,7 +629,6 @@ async def cb_select_qual(c, q):
 
         pct = int(((ep_i + 1) / total) * 100)
 
-        # Progress: connecting
         await q.message.edit_text(
             f"🔄 <b>Resolving Links...</b>\n\n"
             f"📺 {anime_title}\n"
@@ -652,10 +640,8 @@ async def cb_select_qual(c, q):
 
         async with ClientSession() as session:
             if total == 1:
-                # Single episode — use already-fetched quality URL
                 dl_url = await resolve_filepress(fp_url, session)
             else:
-                # Multiple episodes — fetch each ep's qualities
                 quals = await get_qualities(ep_url, session)
                 ep_fp = fp_url
                 for qn, qu in quals:
@@ -697,7 +683,6 @@ async def cb_select_qual(c, q):
         f"⏳ Sending results..."
     )
 
-    # Send each result
     for item in all_results:
         try:
             await c.send_message(
