@@ -1,6 +1,5 @@
-pyrofork
+git+https://github.com/LonamiWebs/Telethon.git@master
 TgCrypto
-curl_cffi
+aiohttp
 beautifulsoup4
-lxml
-python-dotenv
+fake-useragent
