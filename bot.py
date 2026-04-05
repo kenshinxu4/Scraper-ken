@@ -340,8 +340,8 @@ async def report_cmd(c, m):
         await m.reply_text(f"❌ Failed to send report: {e}")
 
 
-# ─── Thumbnail Handler ────────────────────────────────────
-@bot.on_message(filters.photo & filters.private & ~filters.command)
+# ─── Thumbnail Handler (FIXED: filters.invert) ────────────
+@bot.on_message(filters.photo & filters.private & filters.invert(filters.command))
 async def thumb_handler(c, m):
     uid = m.from_user.id
     buf = BytesIO()
@@ -372,7 +372,7 @@ async def search_inline(c, q):
 
 
 # ─── Main Search Handler ──────────────────────────────────
-@bot.on_message(filters.text & filters.private & ~filters.command)
+@bot.on_message(filters.text & filters.private & filters.invert(filters.command))
 async def anime_search(c, m):
     uid = m.from_user.id
     query = m.text.strip()
