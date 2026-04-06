@@ -78,7 +78,7 @@ bot = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    parse_mode=enums.ParseMode.HTML  # ✅ FIXED: Use enum instead of string
+    parse_mode=enums.ParseMode.HTML
 )
 
 # --- HELPER FUNCTIONS ---
@@ -304,9 +304,97 @@ async def cancel_task(client: Client, message: Message):
     else:
         await message.reply("ℹ️ No active task to cancel.")
 
-# --- MESSAGE HANDLER ---
+# ✅ FIXED: SEPARATE HANDLER FOR DOCUMENTS (BULK UPLOAD)
+@bot.on_message(filters.document & filters.private)
+async def document_handler(client: Client, message: Message):
+    """Handle document uploads - especially for bulk upload"""
+    user_id = message.from_user.id
+    
+    # Only admin can bulk upload
+    if user_id != ADMIN_ID:
+        return
+    
+    # Check if it's a .txt file
+    if not message.document.file_name.endswith(".txt"):
+        await message.reply("❌ Only <code>.txt</code> files are supported for bulk upload.")
+        return
+    
+    msg = await message.reply("⏳ <b>Processing Bulk File...</b>")
+    
+    try:
+        # Download file
+        file_path = await message.download()
+        logger.info(f"Downloaded bulk file: {file_path}")
+        
+        # Read and process
+        count = 0
+        errors_list = []
+        
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):  # Skip empty lines and comments
+                continue
+                
+            if "|" not in line:
+                errors_list.append(f"Line {line_num}: No separator found")
+                continue
+            
+            try:
+                parts = line.split("|")
+                if len(parts) < 4:
+                    errors_list.append(f"Line {line_num}: Incomplete data")
+                    continue
+                
+                anime_name = parts[0].strip()
+                img_url = parts[1].strip()
+                link = parts[2].strip()
+                desc = parts[3].strip()
+                
+                if not all([anime_name, img_url, link]):
+                    errors_list.append(f"Line {line_num}: Missing required fields")
+                    continue
+                
+                # Save to database
+                db["animes"][anime_name.lower()] = {
+                    "img": img_url,
+                    "link": link,
+                    "desc": desc
+                }
+                count += 1
+                logger.info(f"Added anime: {anime_name}")
+                
+            except Exception as e:
+                errors_list.append(f"Line {line_num}: {str(e)}")
+                continue
+        
+        # Save database
+        save_db(db)
+        
+        # Cleanup
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        # Send success report
+        result_text = f"✅ <b>Bulk Update Complete!</b>\n\nAdded <code>{count}</code> new records to the database."
+        
+        if errors_list:
+            error_text = "\n".join(errors_list[:10])  # Show first 10 errors
+            if len(errors_list) > 10:
+                error_text += f"\n... and {len(errors_list) - 10} more errors"
+            result_text += f"\n\n⚠️ <b>Errors:</b>\n<pre>{error_text}</pre>"
+        
+        await msg.edit(result_text)
+        logger.info(f"Bulk upload complete: {count} added, {len(errors_list)} errors")
+        
+    except Exception as e:
+        logger.error(f"Bulk upload error: {e}")
+        await msg.edit(f"❌ <b>Error processing file:</b>\n<code>{str(e)}</code>")
 
-@bot.on_message(filters.private & filters.text)
+# --- MESSAGE HANDLER (TEXT ONLY) ---
+@bot.on_message(filters.private & filters.text & ~filters.command)
 async def message_handler(client: Client, message: Message):
     user_id = message.from_user.id
     raw_text = message.text.strip()
@@ -319,7 +407,7 @@ async def message_handler(client: Client, message: Message):
         return
     
     # Admin state handling
-    if user_id in admin_states and not raw_text.startswith('/'):
+    if user_id in admin_states:
         state = admin_states[user_id]
         step = state.get("step")
         
@@ -333,7 +421,6 @@ async def message_handler(client: Client, message: Message):
         
         # SET START MESSAGE (with preview)
         if step == "SET_START_MSG":
-            # Show preview first
             preview_text = (
                 f"👁 <b>PREVIEW:</b>\n\n"
                 f"{raw_text}\n\n"
@@ -364,7 +451,7 @@ async def message_handler(client: Client, message: Message):
             return
         
         # ADD/EDIT ANIME FLOW
-        if state["mode"] in ["ADD", "EDIT"]:
+        if state.get("mode") in ["ADD", "EDIT"]:
             if step == "NAME":
                 state["name"] = lower_text
                 state["step"] = "IMG"
@@ -391,66 +478,35 @@ async def message_handler(client: Client, message: Message):
                 await message.reply(f"🎯 <b>SUCCESS!</b>\n<code>{state['name'].upper()}</code> is now live in the database.")
         return
     
-    # Bulk file upload (Admin only)
-    if user_id == ADMIN_ID and message.document and message.document.file_name.endswith(".txt"):
-        msg = await message.reply("⏳ <b>Processing Bulk File...</b>")
-        try:
-            file_path = await message.download()
-            with open(file_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            
-            count = 0
-            for line in lines:
-                if "|" in line:
-                    try:
-                        parts = line.split("|")
-                        db["animes"][parts[0].strip().lower()] = {
-                            "img": parts[1].strip(),
-                            "link": parts[2].strip(),
-                            "desc": parts[3].strip()
-                        }
-                        count += 1
-                    except:
-                        continue
-            
-            save_db(db)
-            os.remove(file_path)
-            await msg.edit(f"✅ <b>Bulk Update Complete!</b>\nAdded <code>{count}</code> new records to the database.")
-        except Exception as e:
-            logger.error(f"Bulk upload error: {e}")
-            await msg.edit(f"❌ <b>Error:</b> {str(e)}")
-        return
+    # Smart Search (only if not in admin state and not a command)
+    anime_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
     
-    # Smart Search
-    if not raw_text.startswith('/') and user_id not in admin_states:
-        anime_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
-        
-        for name in anime_keys:
-            if name in lower_text:
-                data = db["animes"][name]
-                buttons = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=data['link'])]
-                ])
-                caption = (
-                    f"🎬 <b>ANIME FOUND: {name.upper()}</b>\n\n"
-                    f"📖 <b>SYNOPSIS:</b>\n<blockquote>{data['desc']}</blockquote>\n\n"
-                    f"✨ <b>Channel:</b> @KENSHIN_ANIME"
+    for name in anime_keys:
+        if name in lower_text:
+            data = db["animes"][name]
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=data['link'])]
+            ])
+            caption = (
+                f"🎬 <b>ANIME FOUND: {name.upper()}</b>\n\n"
+                f"📖 <b>SYNOPSIS:</b>\n<blockquote>{data['desc']}</blockquote>\n\n"
+                f"✨ <b>Channel:</b> @KENSHIN_ANIME"
+            )
+            
+            try:
+                await message.reply_photo(
+                    photo=data['img'],
+                    caption=caption,
+                    reply_markup=buttons
                 )
-                
-                try:
-                    await message.reply_photo(
-                        photo=data['img'],
-                        caption=caption,
-                        reply_markup=buttons
-                    )
-                except Exception as e:
-                    await message.reply(
-                        f"⚠️ <b>Image Error, sending text only.</b>\n\n{caption}",
-                        reply_markup=buttons,
-                        disable_web_page_preview=True
-                    )
-                add_user_to_db(user_id)
-                return
+            except Exception as e:
+                await message.reply(
+                    f"⚠️ <b>Image Error, sending text only.</b>\n\n{caption}",
+                    reply_markup=buttons,
+                    disable_web_page_preview=True
+                )
+            add_user_to_db(user_id)
+            return
 
 # --- RUN BOT ---
 if __name__ == "__main__":
