@@ -2,7 +2,13 @@ import os
 import json
 import asyncio
 import re
-from telethon import TelegramClient, events, Button
+import logging
+from datetime import datetime
+from telethon import TelegramClient, events, Button, errors
+
+# --- LOGGING SETUP (Professional touch) ---
+logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 0))
@@ -10,28 +16,33 @@ API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0)) 
 
-# Keeping the database file name simple
+# File Names & Links
 DB_FILE = "kenshin_data.json"
 DEFAULT_START_IMAGE = "https://files.catbox.moe/v4oy6s.jpg"
 SUPPORT_GROUP = "https://t.me/KENSHIN_ANIME_CHAT"
 CHANNEL_LINK = "https://t.me/KENSHIN_ANIME"
 OWNER_USERNAME = "@KENSHIN_ANIME_OWNER"
 
+# --- INITIALIZE BOT ---
+print("🛡️ Booting up Kenshin Anime Engine...")
 bot = TelegramClient('kenshin_pro_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# --- DATABASE LOGIC ---
+# --- DATABASE ENGINE ---
 def load_db():
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r") as f: 
                 return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"DB Load Error: {e}")
     return {"users": [], "animes": {}, "settings": {"start_img": DEFAULT_START_IMAGE}}
 
 def save_db(data):
-    with open(DB_FILE, "w") as f: 
-        json.dump(data, f, indent=4)
+    try:
+        with open(DB_FILE, "w") as f: 
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        logger.error(f"DB Save Error: {e}")
 
 db = load_db()
 admin_states = {}
@@ -40,8 +51,16 @@ def add_user_to_db(chat_id):
     if chat_id not in db["users"]:
         db["users"].append(chat_id)
         save_db(db)
+        logger.info(f"New User Added: {chat_id}")
 
-# --- USER COMMANDS ---
+# --- HELPER FUNCTIONS ---
+async def is_admin(event):
+    if event.sender_id != ADMIN_ID:
+        await event.reply("❌ **Access Denied!** Only Owner can use this.")
+        return False
+    return True
+
+# --- USER INTERFACE COMMANDS ---
 
 @bot.on(events.NewMessage(pattern=r'(?i)^/start'))
 async def start_cmd(event):
@@ -53,128 +72,71 @@ async def start_cmd(event):
         "Official bot of ⚜️ **@KENSHIN_ANIME** ⚜️\n\n"
         "🍿 I provide high-quality Anime links instantly.\n\n"
         "👉 **How to find Anime?**\n"
-        "Just type the name. I can detect it even in long sentences!\n"
+        "Just type the name. I can detect it even in sentences!\n"
         "Example: `Bhai solo leveling hai kya?`.\n\n"
-        "Use `/help` to see more options."
+        "Use `/help` to see all features."
     )
     
     buttons = [
         [Button.url("✨ Join Channel ✨", CHANNEL_LINK)],
-        [Button.url("💬 Support Group 💬", SUPPORT_GROUP)]
+        [Button.url("💬 Support Group 💬", SUPPORT_GROUP)],
+        [Button.url("👑 Contact Owner", f"https://t.me/{OWNER_USERNAME.replace('@','')}")]
     ]
     
     try:
         await bot.send_file(event.chat_id, start_img, caption=welcome_text, buttons=buttons)
-    except:
+    except Exception:
         await event.reply(welcome_text, buttons=buttons)
 
 @bot.on(events.NewMessage(pattern=r'(?i)^/help'))
 async def help_cmd(event):
     help_text = (
-        "🛠 **User Menu**\n\n"
-        "• `/start` - Start the bot\n"
-        "• `/report <msg>` - Request anime or report links\n"
-        "• `/help` - Show this menu\n\n"
-        "🔍 **Search:** Just type the anime name directly."
+        "🛠 **USER INTERFACE MENU**\n\n"
+        "• `/start` - Wake up the bot\n"
+        "• `/report <msg>` - Request anime or report broken links\n"
+        "• `/help` - Show this detailed menu\n\n"
+        "🔍 **PRO TIP:** You don't need commands to search. Just send the anime name directly in the chat!"
     )
     
     if event.sender_id == ADMIN_ID:
         help_text += (
-            "\n\n👑 **Admin Commands:**\n"
-            "• `/add_ani` - Add anime\n"
-            "• `/edit_ani` - Edit existing\n"
-            "• `/set_start_img <url>` - Change /start image\n"
-            "• `/bulk` - Get bulk upload info\n"
-            "• `/list` - View all anime names\n"
-            "• `/broadcast` - (Reply to msg) to broadcast\n"
-            "• `/cancel` - Stop current task"
+            "\n\n⚡ **ADMINISTRATOR PANEL**\n"
+            "• `/add_ani` - Add a new entry\n"
+            "• `/edit_ani` - Modify existing data\n"
+            "• `/set_start_img` - Update bot banner\n"
+            "• `/bulk` - Instruction for mass upload\n"
+            "• `/list` - Database overview\n"
+            "• `/stats` - Total users & animes\n"
+            "• `/broadcast` - Global announcement\n"
+            "• `/cancel` - Abort ongoing setup"
         )
     await event.reply(help_text)
 
-@bot.on(events.NewMessage(pattern=r'(?i)^/report(?: |$)(.*)'))
-async def report_cmd(event):
-    msg = event.pattern_match.group(1).strip()
-    if not msg:
-        return await event.reply("⚠️ **Usage:** `/report I need Naruto episodes`.")
-    
-    user = await event.get_sender()
-    username = f"@{user.username}" if user.username else f"ID: {user.id}"
-    
-    try:
-        await bot.send_message(ADMIN_ID, f"📢 **NEW REQUEST**\n\n👤 **From:** {username}\n📝 **Message:** {msg}")
-        await event.reply(f"✅ Sent to **{OWNER_USERNAME}**. Please wait!")
-    except:
-        await event.reply("❌ Error. Contact owner directly.")
+@bot.on(events.NewMessage(pattern=r'(?i)^/stats'))
+async def stats_cmd(event):
+    if not await is_admin(event): return
+    total_users = len(db.get("users", []))
+    total_animes = len(db.get("animes", {}))
+    await event.reply(f"📊 **BOT STATISTICS**\n\n👥 Total Users: `{total_users}`\n🎬 Total Animes: `{total_animes}`")
 
-# --- ADMIN COMMANDS ---
-
-@bot.on(events.NewMessage(pattern=r'(?i)^/set_start_img(?: |$)(.*)'))
-async def set_img(event):
-    if event.sender_id != ADMIN_ID: return
-    link = event.pattern_match.group(1).strip()
-    if not link.startswith("http"):
-        return await event.reply("⚠️ Invalid URL.")
-    
-    if "settings" not in db: db["settings"] = {}
-    db["settings"]["start_img"] = link
-    save_db(db)
-    await event.reply("✅ Start image updated successfully!")
-
-@bot.on(events.NewMessage(pattern=r'(?i)^/broadcast'))
-async def broadcast_cmd(event):
-    if event.sender_id != ADMIN_ID: return
-    reply = await event.get_reply_message()
-    if not reply:
-        return await event.reply("⚠️ Reply to a message with `/broadcast`.")
-    
-    status = await event.reply("📡 Broadcasting... Please wait.")
-    success, failed = 0, 0
-    for uid in db.get("users", []):
-        try:
-            await bot.send_message(uid, reply)
-            success += 1
-            await asyncio.sleep(0.3)
-        except:
-            failed += 1
-    await status.edit(f"✅ **Broadcast Done!**\n\nSuccess: {success}\nFailed: {failed}")
-
-@bot.on(events.NewMessage(pattern=r'(?i)^/list'))
-async def list_ani(event):
-    if event.sender_id != ADMIN_ID: return
-    animes = db.get("animes", {})
-    if not animes: return await event.reply("DB is empty.")
-    
-    names = "\n".join([f"• `{n.title()}`" for n in animes.keys()])
-    await event.reply(f"📂 **Anime List:**\n\n{names}"[:4000])
-
-@bot.on(events.NewMessage(pattern=r'(?i)^/bulk'))
-async def bulk_info(event):
-    if event.sender_id != ADMIN_ID: return
-    await event.reply(
-        "📁 **Bulk Upload Guide**\n\n"
-        "Send a `.txt` file with this format:\n"
-        "`Name | Image_URL | Link | Synopsis`"
-    )
-
-# --- ADMIN FLOW HANDLERS ---
+# --- ADMIN CORE OPERATIONS ---
 
 @bot.on(events.NewMessage(pattern=r'(?i)^/(add_ani|edit_ani)$'))
 async def admin_init(event):
-    if event.sender_id != ADMIN_ID: return
-    # Mode check karne ke liye lower thik hai
+    if not await is_admin(event): return
     mode = "ADD" if "add" in event.text.lower() else "EDIT"
     admin_states[event.sender_id] = {"step": "NAME", "mode": mode}
-    await event.reply(f"🚀 **{mode} Mode**\nEnter Anime Name:")
+    await event.reply(f"🚀 **ENTRY {mode} INITIATED**\n\nStep 1: Please enter the **Anime Name**:")
 
 @bot.on(events.NewMessage)
-async def main_handler(event):
+async def system_handler(event):
     uid = event.sender_id
-    # 🔥 YAHAN DHAYAN DO: Humne do alag variables banaye hain
-    raw_text = (event.text or "").strip() # Original text (Links ke liye)
-    lower_text = raw_text.lower() # Lowercase text (Commands/Search ke liye)
+    raw_text = (event.text or "").strip()
+    lower_text = raw_text.lower()
 
-    # 1. Bulk File Processing
+    # --- 1. Bulk Database Update ---
     if uid == ADMIN_ID and event.document and event.file.name.endswith(".txt"):
+        msg = await event.reply("⏳ **Processing Bulk File...**")
         file_bytes = await event.download_media(bytes)
         lines = file_bytes.decode('utf-8').splitlines()
         count = 0
@@ -183,64 +145,92 @@ async def main_handler(event):
                 try:
                     p = line.split("|")
                     db["animes"][p[0].strip().lower()] = {
-                        "img": p[1].strip(), 
-                        "link": p[2].strip(), # Link original rahega
-                        "desc": p[3].strip()
+                        "img": p[1].strip(), "link": p[2].strip(), "desc": p[3].strip()
                     }
                     count += 1
                 except: continue
         save_db(db)
-        return await event.reply(f"✅ Bulk Upload success! Added **{count}** entries.")
+        await msg.edit(f"✅ **Bulk Update Complete!**\nAdded `{count}` new records to the database.")
+        return
 
-    # 2. Admin Logic Steps
+    # --- 2. Step-by-Step Entry Logic (CASE SENSITIVE SAFE) ---
     if uid in admin_states and not raw_text.startswith('/'):
         state = admin_states[uid]
+        
         if state["step"] == "NAME":
             state["name"] = lower_text
             state["step"] = "IMG"
-            await event.reply("👉 Now send Image URL:")
+            await event.reply("🔗 **Step 2:** Send the **Image URL** (Catbox/Telegraph):")
+            
         elif state["step"] == "IMG":
-            state["img"] = raw_text # Image URL original case mein
+            state["img"] = raw_text
             state["step"] = "LINK"
-            await event.reply("👉 Now send Download/Watch Link:")
+            await event.reply("📥 **Step 3:** Send the **Download/Join Link** (Case Sensitive):")
+            
         elif state["step"] == "LINK":
-            state["link"] = raw_text # 🔥 FIX: Link ab small letters mein nahi badlega!
+            state["link"] = raw_text # PRESERVING CASE FOR TELEGRAM LINKS
             state["step"] = "DESC"
-            await event.reply("👉 Now enter Synopsis/Description:")
+            await event.reply("📝 **Step 4:** Send a short **Synopsis/Description**:")
+            
         elif state["step"] == "DESC":
             db["animes"][state["name"]] = {
                 "img": state["img"], 
                 "link": state["link"], 
-                "desc": raw_text # Description bhi original case mein
+                "desc": raw_text
             }
             save_db(db)
             del admin_states[uid]
-            await event.reply(f"✅ `{state['name'].title()}` has been saved!")
+            await event.reply(f"🎯 **SUCCESS!**\n`{state['name'].upper()}` is now live in the database.")
         return
 
-    # 3. Smart Search (Works in Private and Groups)
-    if text and not text.startswith('/') and uid not in admin_states:
-        add_user_to_db(event.chat_id)
+    # --- 3. Smart Search Engine ---
+    if lower_text and not lower_text.startswith('/') and uid not in admin_states:
+        # Longest match priority
+        anime_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
         
-        # Priority matching (Longest names first)
-        sorted_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
-        
-        for name in sorted_keys:
-            if name in text:
+        for name in anime_keys:
+            if name in lower_text:
                 data = db["animes"][name]
-                btns = [[Button.url("▪︎ DOWNLOAD / WATCH ▪︎", data['link'])]]
-                cap = f"🎬 **{name.upper()}**\n\n📖 **Synopsis:**\n{data['desc']}\n\n✨ Powered by **@KENSHIN_ANIME**"
+                btn = [[Button.url("🚀 DOWNLOAD / WATCH NOW 🚀", data['link'])]]
+                caption = (
+                    f"🎬 **ANIME FOUND: {name.upper()}**\n\n"
+                    f"📖 **SYNOPSIS:**\n{data['desc']}\n\n"
+                    f"✨ **Channel:** @KENSHIN_ANIME"
+                )
                 try:
-                    await event.reply(cap, file=data['img'], buttons=btns)
-                except:
-                    await event.reply(f"⚠️ Image Error\n\n{cap}", buttons=btns)
+                    await event.reply(caption, file=data['img'], buttons=btn)
+                    add_user_to_db(event.chat_id) # Save user on search
+                except Exception as e:
+                    await event.reply(f"⚠️ **Image Error, sending text only.**\n\n{caption}", buttons=btn)
                 return
+
+# --- UTILITY COMMANDS ---
+
+@bot.on(events.NewMessage(pattern=r'(?i)^/broadcast'))
+async def broadcast_cmd(event):
+    if not await is_admin(event): return
+    reply = await event.get_reply_message()
+    if not reply: return await event.reply("❌ Reply to a message to broadcast it.")
+    
+    confirm = await event.reply("📡 **Global Broadcast Started...**")
+    count, deleted = 0, 0
+    
+    for user_id in db.get("users", []):
+        try:
+            await bot.send_message(user_id, reply)
+            count += 1
+            await asyncio.sleep(0.2) # Flood prevention
+        except errors.UserIsBlockedError:
+            deleted += 1
+        except: pass
+        
+    await confirm.edit(f"📢 **Broadcast Finished!**\n\n✅ Delivered: `{count}`\n🚫 Blocked/Failed: `{deleted}`")
 
 @bot.on(events.NewMessage(pattern=r'(?i)^/cancel'))
 async def cancel_task(event):
     if event.sender_id in admin_states:
         del admin_states[event.sender_id]
-        await event.reply("✅ Process cancelled.")
+        await event.reply("✅ **Current task cancelled.**")
 
-print("🚀 KENSHIN BOT STARTED SUCCESSFULLY!")
+print("💎 Kenshin Pro Version is Online!")
 bot.run_until_disconnected()
