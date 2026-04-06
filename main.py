@@ -510,8 +510,8 @@ async def message_handler(client: Client, message: Message):
             ])
             caption = (
                 f"🎬 <b>ANIME:✨ {name.upper()} ✨</b>\n\n"
-                f"📖 <b>SYNOPSIS:</b>\n<blockquote>{data['desc']}</blockquote>\n\n"
-                f"✨ <b>FOR MORE JOIN:</b> [@KENSHIN_ANIME & @MANWHA_VERSE]"
+                f"📖 <b>SYNOPSIS:</b>\n<b><blockquote>{data['desc']}</blockquote></b>\n\n"
+                f"✨ <b>FOR MORE JOIN:</b><b><blockquote>[@KENSHIN_ANIME & @MANWHA_VERSE]</blockquote></b>"
             )
             
             try:
