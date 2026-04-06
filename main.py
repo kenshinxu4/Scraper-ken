@@ -161,6 +161,7 @@ async def bulk_info(event):
 @bot.on(events.NewMessage(pattern=r'(?i)^/(add_ani|edit_ani)$'))
 async def admin_init(event):
     if event.sender_id != ADMIN_ID: return
+    # Mode check karne ke liye lower thik hai
     mode = "ADD" if "add" in event.text.lower() else "EDIT"
     admin_states[event.sender_id] = {"step": "NAME", "mode": mode}
     await event.reply(f"🚀 **{mode} Mode**\nEnter Anime Name:")
@@ -168,7 +169,9 @@ async def admin_init(event):
 @bot.on(events.NewMessage)
 async def main_handler(event):
     uid = event.sender_id
-    text = (event.text or "").strip().lower()
+    # 🔥 YAHAN DHAYAN DO: Humne do alag variables banaye hain
+    raw_text = (event.text or "").strip() # Original text (Links ke liye)
+    lower_text = raw_text.lower() # Lowercase text (Commands/Search ke liye)
 
     # 1. Bulk File Processing
     if uid == ADMIN_ID and event.document and event.file.name.endswith(".txt"):
@@ -180,7 +183,9 @@ async def main_handler(event):
                 try:
                     p = line.split("|")
                     db["animes"][p[0].strip().lower()] = {
-                        "img": p[1].strip(), "link": p[2].strip(), "desc": p[3].strip()
+                        "img": p[1].strip(), 
+                        "link": p[2].strip(), # Link original rahega
+                        "desc": p[3].strip()
                     }
                     count += 1
                 except: continue
@@ -188,23 +193,25 @@ async def main_handler(event):
         return await event.reply(f"✅ Bulk Upload success! Added **{count}** entries.")
 
     # 2. Admin Logic Steps
-    if uid in admin_states and not text.startswith('/'):
+    if uid in admin_states and not raw_text.startswith('/'):
         state = admin_states[uid]
         if state["step"] == "NAME":
-            state["name"] = text
+            state["name"] = lower_text
             state["step"] = "IMG"
             await event.reply("👉 Now send Image URL:")
         elif state["step"] == "IMG":
-            state["img"] = text
+            state["img"] = raw_text # Image URL original case mein
             state["step"] = "LINK"
             await event.reply("👉 Now send Download/Watch Link:")
         elif state["step"] == "LINK":
-            state["link"] = text
+            state["link"] = raw_text # 🔥 FIX: Link ab small letters mein nahi badlega!
             state["step"] = "DESC"
             await event.reply("👉 Now enter Synopsis/Description:")
         elif state["step"] == "DESC":
             db["animes"][state["name"]] = {
-                "img": state["img"], "link": state["link"], "desc": event.text
+                "img": state["img"], 
+                "link": state["link"], 
+                "desc": raw_text # Description bhi original case mein
             }
             save_db(db)
             del admin_states[uid]
