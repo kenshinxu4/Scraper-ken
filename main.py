@@ -25,6 +25,7 @@ DEFAULT_START_IMAGE = "https://files.catbox.moe/v4oy6s.jpg"
 SUPPORT_GROUP = "https://t.me/KENSHIN_ANIME_CHAT"
 CHANNEL_LINK = "https://t.me/KENSHIN_ANIME"
 OWNER_USERNAME = "@KENSHIN_ANIME_OWNER"
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "KENSHIN_ANIME_SEARCH_BOT")  # Set your bot username
 
 # Default start message
 DEFAULT_START_MSG = (
@@ -90,11 +91,24 @@ async def is_admin(_, __, message: Message):
 
 admin_filter = filters.create(is_admin)
 
-# --- USER COMMANDS ---
+def get_text_from_message(message: Message) -> str:
+    """Extract text from message or caption"""
+    if message.text:
+        return message.text
+    if message.caption:
+        return message.caption
+    return ""
 
-@bot.on_message(filters.command("start") & filters.private)
+def remove_bot_mention(text: str) -> str:
+    """Remove @bot_username from text"""
+    return text.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.lower()}", "").strip()
+
+# --- COMMANDS (PRIVATE & GROUP) ---
+
+@bot.on_message(filters.command("start") & (filters.private | filters.group))
 async def start_cmd(client: Client, message: Message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
     add_user_to_db(user_id)
     
     start_img = db.get("settings", {}).get("start_img", DEFAULT_START_IMAGE)
@@ -107,20 +121,16 @@ async def start_cmd(client: Client, message: Message):
     ])
     
     try:
-        await message.reply_photo(
-            photo=start_img,
-            caption=start_msg,
-            reply_markup=buttons
-        )
+        if message.chat.type == "private":
+            await message.reply_photo(photo=start_img, caption=start_msg, reply_markup=buttons)
+        else:
+            # In group, send without buttons or with different text
+            await message.reply(f"👋 <b>Hello!</b> I'm Kenshin Anime Bot!\n\nI work in groups too! Just type any anime name and I'll find it for you.\n\nUse me in DM for better experience: @{BOT_USERNAME}")
     except Exception as e:
-        logger.error(f"Start image error: {e}")
-        await message.reply(
-            text=start_msg,
-            reply_markup=buttons,
-            disable_web_page_preview=True
-        )
+        logger.error(f"Start error: {e}")
+        await message.reply("👋 Hello! I'm Kenshin Anime Bot! Type any anime name to search.")
 
-@bot.on_message(filters.command("help") & filters.private)
+@bot.on_message(filters.command("help") & (filters.private | filters.group))
 async def help_cmd(client: Client, message: Message):
     help_text = (
         "🛠 <b>USER INTERFACE MENU</b>\n\n"
@@ -144,9 +154,11 @@ async def help_cmd(client: Client, message: Message):
             "• <code>/broadcast</code> - Global announcement\n"
             "• <code>/cancel</code> - Abort ongoing setup"
         )
+    
+    # In group, reply to message so user sees it
     await message.reply(help_text)
 
-@bot.on_message(filters.command("report") & filters.private)
+@bot.on_message(filters.command("report") & (filters.private | filters.group))
 async def report_cmd(client: Client, message: Message):
     if len(message.command) < 2:
         await message.reply(
@@ -167,6 +179,7 @@ async def report_cmd(client: Client, message: Message):
             f"📢 <b>NEW REPORT</b>\n\n"
             f"<b>From:</b> <a href='tg://user?id={user.id}'>{user.first_name}</a>\n"
             f"<b>User ID:</b> <code>{user.id}</code>\n"
+            f"<b>Chat:</b> {'Private' if message.chat.type == 'private' else message.chat.title}\n"
             f"<b>Username:</b> @{user.username or 'None'}\n\n"
             f"<blockquote>{report_text}</blockquote>\n\n"
             f"Reply to this message to respond to the user."
@@ -176,7 +189,7 @@ async def report_cmd(client: Client, message: Message):
         logger.error(f"Report forwarding failed: {e}")
         await message.reply("❌ Failed to send report. Please contact admin directly.")
 
-# --- ADMIN COMMANDS ---
+# --- ADMIN COMMANDS (PRIVATE ONLY - SECURITY) ---
 
 @bot.on_message(filters.command("stats") & admin_filter & filters.private)
 async def stats_cmd(client: Client, message: Message):
@@ -295,7 +308,7 @@ async def broadcast_cmd(client: Client, message: Message):
         f"🚫 Blocked/Failed: <code>{deleted}</code>"
     )
 
-@bot.on_message(filters.command("cancel") & filters.private)
+@bot.on_message(filters.command("cancel") & (filters.private | filters.group))
 async def cancel_task(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in admin_states:
@@ -304,7 +317,7 @@ async def cancel_task(client: Client, message: Message):
     else:
         await message.reply("ℹ️ No active task to cancel.")
 
-# ✅ FIXED: SEPARATE HANDLER FOR DOCUMENTS (BULK UPLOAD)
+# ✅ DOCUMENT HANDLER (BULK UPLOAD) - PRIVATE ONLY
 @bot.on_message(filters.document & filters.private)
 async def document_handler(client: Client, message: Message):
     """Handle document uploads - especially for bulk upload"""
@@ -335,7 +348,7 @@ async def document_handler(client: Client, message: Message):
         
         for line_num, line in enumerate(lines, 1):
             line = line.strip()
-            if not line or line.startswith("#"):  # Skip empty lines and comments
+            if not line or line.startswith("#"):
                 continue
                 
             if "|" not in line:
@@ -357,7 +370,6 @@ async def document_handler(client: Client, message: Message):
                     errors_list.append(f"Line {line_num}: Missing required fields")
                     continue
                 
-                # Save to database
                 db["animes"][anime_name.lower()] = {
                     "img": img_url,
                     "link": link,
@@ -370,18 +382,15 @@ async def document_handler(client: Client, message: Message):
                 errors_list.append(f"Line {line_num}: {str(e)}")
                 continue
         
-        # Save database
         save_db(db)
         
-        # Cleanup
         if os.path.exists(file_path):
             os.remove(file_path)
         
-        # Send success report
         result_text = f"✅ <b>Bulk Update Complete!</b>\n\nAdded <code>{count}</code> new records to the database."
         
         if errors_list:
-            error_text = "\n".join(errors_list[:10])  # Show first 10 errors
+            error_text = "\n".join(errors_list[:10])
             if len(errors_list) > 10:
                 error_text += f"\n... and {len(errors_list) - 10} more errors"
             result_text += f"\n\n⚠️ <b>Errors:</b>\n<pre>{error_text}</pre>"
@@ -393,12 +402,22 @@ async def document_handler(client: Client, message: Message):
         logger.error(f"Bulk upload error: {e}")
         await msg.edit(f"❌ <b>Error processing file:</b>\n<code>{str(e)}</code>")
 
-# --- MESSAGE HANDLER (TEXT ONLY) ---
-@bot.on_message(filters.private & filters.text & ~filters.command(["start", "help", "report", "stats", "set_start_img", "set_start_msg", "view_start_msg", "bulk", "list", "add_ani", "edit_ani", "broadcast", "cancel"]))
+# ✅ MESSAGE HANDLER (TEXT ONLY) - PRIVATE & GROUP
+@bot.on_message(filters.text & (filters.private | filters.group) & ~filters.command(["start", "help", "report", "stats", "set_start_img", "set_start_msg", "view_start_msg", "bulk", "list", "add_ani", "edit_ani", "broadcast", "cancel"]))
 async def message_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    raw_text = message.text.strip()
+    raw_text = get_text_from_message(message)
+    
+    # Remove bot mention if in group
+    if message.chat.type != "private":
+        raw_text = remove_bot_mention(raw_text)
+    
+    raw_text = raw_text.strip()
     lower_text = raw_text.lower()
+    
+    # Ignore empty messages
+    if not raw_text:
+        return
     
     # Cancel check
     if lower_text == "cancel" and user_id in admin_states:
@@ -406,8 +425,8 @@ async def message_handler(client: Client, message: Message):
         await message.reply("✅ <b>Task cancelled.</b>")
         return
     
-    # Admin state handling
-    if user_id in admin_states:
+    # Admin state handling (PRIVATE ONLY)
+    if user_id in admin_states and message.chat.type == "private" and not raw_text.startswith('/'):
         state = admin_states[user_id]
         step = state.get("step")
         
@@ -419,7 +438,7 @@ async def message_handler(client: Client, message: Message):
             await message.reply("✅ <b>Start image updated successfully!</b>")
             return
         
-        # SET START MESSAGE (with preview)
+        # SET START MESSAGE
         if step == "SET_START_MSG":
             preview_text = (
                 f"👁 <b>PREVIEW:</b>\n\n"
@@ -440,7 +459,6 @@ async def message_handler(client: Client, message: Message):
                 del admin_states[user_id]
                 await message.reply("✅ <b>Start message updated successfully!</b>")
             else:
-                # New text, show preview again
                 state["pending_msg"] = raw_text
                 preview_text = (
                     f"👁 <b>UPDATED PREVIEW:</b>\n\n"
@@ -478,37 +496,38 @@ async def message_handler(client: Client, message: Message):
                 await message.reply(f"🎯 <b>SUCCESS!</b>\n<code>{state['name'].upper()}</code> is now live in the database.")
         return
     
-    # Smart Search (only if not in admin state and not a command)
-    anime_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
-    
-    for name in anime_keys:
-        if name in lower_text:
-            data = db["animes"][name]
-            buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=data['link'])]
-            ])
-            caption = (
-                f"🎬 <b>ANIME FOUND: {name.upper()}</b>\n\n"
-                f"📖 <b>SYNOPSIS:</b>\n<blockquote>{data['desc']}</blockquote>\n\n"
-                f"✨ <b>Channel:</b> @KENSHIN_ANIME"
-            )
-            
-            try:
-                await message.reply_photo(
-                    photo=data['img'],
-                    caption=caption,
-                    reply_markup=buttons
+    # Smart Search (PRIVATE & GROUP)
+    if not raw_text.startswith('/'):
+        anime_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
+        
+        for name in anime_keys:
+            if name in lower_text:
+                data = db["animes"][name]
+                buttons = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=data['link'])]
+                ])
+                caption = (
+                    f"🎬 <b>ANIME FOUND: {name.upper()}</b>\n\n"
+                    f"📖 <b>SYNOPSIS:</b>\n<blockquote>{data['desc']}</blockquote>\n\n"
+                    f"✨ <b>Channel:</b> @KENSHIN_ANIME"
                 )
-            except Exception as e:
-                await message.reply(
-                    f"⚠️ <b>Image Error, sending text only.</b>\n\n{caption}",
-                    reply_markup=buttons,
-                    disable_web_page_preview=True
-                )
-            add_user_to_db(user_id)
-            return
+                
+                try:
+                    await message.reply_photo(
+                        photo=data['img'],
+                        caption=caption,
+                        reply_markup=buttons
+                    )
+                except Exception as e:
+                    await message.reply(
+                        f"⚠️ <b>Image Error, sending text only.</b>\n\n{caption}",
+                        reply_markup=buttons,
+                        disable_web_page_preview=True
+                    )
+                add_user_to_db(user_id)
+                return
 
 # --- RUN BOT ---
 if __name__ == "__main__":
-    print("💎 Kenshin Pro Version with PyroFork is Online!")
+    print("💎 Kenshin Pro Version with Group Support is Online!")
     bot.run()
