@@ -63,7 +63,7 @@ async def start_cmd(event):
     
     buttons = [
         [Button.url("✨ Join Channel ✨", "https://t.me/KENSHIN_ANIME")],
-        [Button.url("💬 Support Group 💬", "https://t.me/KENSHIN_ANIME")]
+        [Button.url("💬 Support Group 💬", "https://t.me/KENSHIN_ANIME_CHAT")]
     ]
     
     try:
