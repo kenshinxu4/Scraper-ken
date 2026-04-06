@@ -22,7 +22,7 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "").replace("@", "")
 
 # File Names & Links
 DB_FILE = "kenshin_data.json"
-DEFAULT_START_IMAGE = "https://files.catbox.moe/v4oy6s.jpg"
+DEFAULT_START_IMAGE = "https://files.catbox.moe/b2d47q.jpg"
 SUPPORT_GROUP = "https://t.me/KENSHIN_ANIME_CHAT"
 CHANNEL_LINK = "https://t.me/KENSHIN_ANIME"
 OWNER_USERNAME = "@KENSHIN_ANIME_OWNER"
