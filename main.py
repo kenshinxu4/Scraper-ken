@@ -3,7 +3,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime
-from pyrogram import Client, filters, errors
+from pyrogram import Client, filters, errors, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 
 # --- LOGGING SETUP ---
@@ -78,7 +78,7 @@ bot = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    parse_mode="html"  # Enable HTML parsing by default
+    parse_mode=enums.ParseMode.HTML  # ✅ FIXED: Use enum instead of string
 )
 
 # --- HELPER FUNCTIONS ---
