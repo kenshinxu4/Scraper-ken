@@ -21,13 +21,14 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "").replace("@", "")
 
 # File Names & Links
-DB_FILE = "kenshin_data.json"
+# ✅ PERSISTENT STORAGE PATH (Container mein /data folder mount karo)
+DB_FILE = os.environ.get("DB_FILE", "/data/kenshin_data.json")
 DEFAULT_START_IMAGE = "https://files.catbox.moe/b2d47q.jpg"
 SUPPORT_GROUP = "https://t.me/KENSHIN_ANIME_CHAT"
 CHANNEL_LINK = "https://t.me/KENSHIN_ANIME"
 OWNER_USERNAME = "@KENSHIN_ANIME_OWNER"
 
-# Default start message (ORIGINAL FORMAT)
+# Default start message
 DEFAULT_START_MSG = (
     "🌸 <b>Welcome to KENSHIN ANIME Search!</b> 🌸\n\n"
     "<blockquote>Official bot of ⚜️ @KENSHIN_ANIME ⚜️</blockquote>\n\n"
@@ -38,14 +39,25 @@ DEFAULT_START_MSG = (
     "Use /help to see all features."
 )
 
-# --- DATABASE ENGINE ---
+# --- DATABASE ENGINE (PERSISTENT) ---
 def load_db():
+    """Load database from persistent storage"""
+    # ✅ Ensure directory exists
+    db_dir = os.path.dirname(DB_FILE)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        logger.info(f"Created directory: {db_dir}")
+    
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                logger.info(f"Database loaded: {len(data.get('animes', {}))} animes, {len(data.get('users', []))} users")
+                return data
         except Exception as e:
             logger.error(f"DB Load Error: {e}")
+    
+    logger.info("Creating new database")
     return {
         "users": [],
         "animes": {},
@@ -56,12 +68,27 @@ def load_db():
     }
 
 def save_db(data):
+    """Save database to persistent storage"""
     try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
+        # ✅ Ensure directory exists before saving
+        db_dir = os.path.dirname(DB_FILE)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+        
+        # ✅ Atomic write (pehle temp file, phir rename)
+        temp_file = DB_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
+        
+        # ✅ Atomic rename (corruption protection)
+        os.replace(temp_file, DB_FILE)
+        logger.info(f"Database saved: {len(data.get('animes', {}))} animes")
+        return True
     except Exception as e:
         logger.error(f"DB Save Error: {e}")
+        return False
 
+# ✅ GLOBAL DB INSTANCE
 db = load_db()
 admin_states = {}
 
@@ -94,7 +121,6 @@ admin_filter = filters.create(is_admin)
 def get_text(message: Message) -> str:
     """Get text from message or caption"""
     text = message.text or message.caption or ""
-    # Remove bot mention in groups
     if BOT_USERNAME and message.chat.type != "private":
         text = text.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.lower()}", "")
     return text.strip()
@@ -107,6 +133,10 @@ async def start_cmd_private(client: Client, message: Message):
     user_id = message.from_user.id
     add_user_to_db(user_id)
     
+    # ✅ Reload DB to get latest settings
+    global db
+    db = load_db()
+    
     start_img = db.get("settings", {}).get("start_img", DEFAULT_START_IMAGE)
     start_msg = db.get("settings", {}).get("start_msg", DEFAULT_START_MSG)
     
@@ -117,7 +147,6 @@ async def start_cmd_private(client: Client, message: Message):
     ])
     
     try:
-        # ORIGINAL: Send photo with caption and buttons
         await message.reply_photo(
             photo=start_img,
             caption=start_msg,
@@ -125,7 +154,6 @@ async def start_cmd_private(client: Client, message: Message):
         )
     except Exception as e:
         logger.error(f"Start photo error: {e}")
-        # Fallback to text
         await message.reply(
             text=start_msg,
             reply_markup=buttons,
@@ -160,6 +188,7 @@ async def help_cmd(client: Client, message: Message):
             "• <code>/set_start_img</code> - Update bot banner\n"
             "• <code>/set_start_msg</code> - Edit start message with HTML\n"
             "• <code>/view_start_msg</code> - Preview current start message\n"
+            "• <code>/view_start_img</code> - Preview current start image\n"
             "• <code>/bulk</code> - Instruction for mass upload\n"
             "• <code>/list</code> - Database overview\n"
             "• <code>/stats</code> - Total users & animes\n"
@@ -203,27 +232,103 @@ async def report_cmd(client: Client, message: Message):
 
 @bot.on_message(filters.command("stats") & admin_filter & filters.private)
 async def stats_cmd(client: Client, message: Message):
+    # ✅ Reload to get latest data
+    global db
+    db = load_db()
+    
     total_users = len(db.get("users", []))
     total_animes = len(db.get("animes", {}))
     await message.reply(
         f"📊 <b>BOT STATISTICS</b>\n\n"
         f"👥 Total Users: <code>{total_users}</code>\n"
-        f"🎬 Total Animes: <code>{total_animes}</code>"
+        f"🎬 Total Animes: <code>{total_animes}</code>\n\n"
+        f"💾 <b>Database:</b> <code>{DB_FILE}</code>"
     )
 
+# ✅ FIXED: set_start_img with proper state handling
 @bot.on_message(filters.command("set_start_img") & admin_filter & filters.private)
 async def set_start_img_cmd(client: Client, message: Message):
-    admin_states[message.from_user.id] = {"step": "SET_START_IMG"}
+    """Set start image - FIXED VERSION"""
+    user_id = message.from_user.id
+    
+    # Check if user sent URL directly with command
+    if len(message.command) > 1:
+        # Direct URL provided: /set_start_img <url>
+        img_url = message.command[1]
+        
+        # Validate URL
+        if not img_url.startswith(("http://", "https://")):
+            await message.reply("❌ Invalid URL. Must start with http:// or https://")
+            return
+        
+        # Save to DB
+        db["settings"]["start_img"] = img_url
+        if save_db(db):
+            await message.reply(
+                f"✅ <b>Start image updated successfully!</b>\n\n"
+                f"New Image URL: <code>{img_url}</code>\n\n"
+                f"Use /view_start_img to preview or /start to see it in action!"
+            )
+        else:
+            await message.reply("❌ Failed to save. Check logs.")
+        return
+    
+    # No URL provided, enter interactive mode
+    admin_states[user_id] = {"step": "SET_START_IMG"}
     await message.reply(
         "🖼 <b>Update Start Image</b>\n\n"
-        "Please send the new image URL (Catbox/Telegraph link):\n"
-        "Or send <code>cancel</code> to abort."
+        "Send the new image URL (Catbox/Telegraph link):\n"
+        "Or send <code>cancel</code> to abort.\n\n"
+        "<i>Tip: You can also use:</i> <code>/set_start_img &lt;url&gt;</code>"
     )
+
+# ✅ NEW: View current start image
+@bot.on_message(filters.command("view_start_img") & admin_filter & filters.private)
+async def view_start_img_cmd(client: Client, message: Message):
+    """View current start image"""
+    global db
+    db = load_db()  # Reload to get latest
+    
+    current_img = db.get("settings", {}).get("start_img", DEFAULT_START_IMAGE)
+    
+    try:
+        await message.reply_photo(
+            photo=current_img,
+            caption=f"👁 <b>CURRENT START IMAGE</b>\n\n"
+                    f"URL: <code>{current_img}</code>\n\n"
+                    f"Use <code>/set_start_img</code> to change."
+        )
+    except Exception as e:
+        await message.reply(
+            f"⚠️ <b>Cannot display image</b>\n\n"
+            f"URL: <code>{current_img}</code>\n"
+            f"Error: <code>{str(e)}</code>\n\n"
+            f"Use <code>/set_start_img</code> to change."
+        )
 
 @bot.on_message(filters.command("set_start_msg") & admin_filter & filters.private)
 async def set_start_msg_cmd(client: Client, message: Message):
+    """Set start message"""
+    user_id = message.from_user.id
+    
+    # Check if user sent message directly with command
+    if len(message.command) > 1:
+        # Direct message provided: /set_start_msg <message>
+        new_msg = " ".join(message.command[1:])
+        
+        db["settings"]["start_msg"] = new_msg
+        if save_db(db):
+            await message.reply(
+                f"✅ <b>Start message updated!</b>\n\n"
+                f"Use /view_start_msg to preview."
+            )
+        else:
+            await message.reply("❌ Failed to save.")
+        return
+    
+    # Interactive mode
     current_msg = db.get("settings", {}).get("start_msg", DEFAULT_START_MSG)
-    admin_states[message.from_user.id] = {"step": "SET_START_MSG"}
+    admin_states[user_id] = {"step": "SET_START_MSG"}
     
     await message.reply(
         "📝 <b>EDIT START MESSAGE</b>\n\n"
@@ -235,16 +340,19 @@ async def set_start_msg_cmd(client: Client, message: Message):
         "• <code>&lt;s&gt;</code> - <s>Strikethrough</s>\n"
         "• <code>&lt;blockquote&gt;</code> - <blockquote>Quote</blockquote>\n"
         "• <code>&lt;a href='url'&gt;</code> - <a href='https://t.me'>Links</a>\n"
-        "• <code>&lt;code&gt;</code> - <code>Code</code>\n"
-        "• <code>&lt;pre&gt;</code> - Preformatted text\n\n"
+        "• <code>&lt;code&gt;</code> - <code>Code</code>\n\n"
         "<b>Current Message:</b>\n"
-        f"<blockquote>{current_msg[:500]}...</blockquote>\n\n"
+        f"<blockquote>{current_msg[:300]}...</blockquote>\n\n"
         "Send <code>cancel</code> to abort.\n"
-        "Send new message to preview:"
+        "Or use: <code>/set_start_msg &lt;your message&gt;</code>"
     )
 
 @bot.on_message(filters.command("view_start_msg") & admin_filter & filters.private)
 async def view_start_msg_cmd(client: Client, message: Message):
+    """View current start message"""
+    global db
+    db = load_db()
+    
     current_msg = db.get("settings", {}).get("start_msg", DEFAULT_START_MSG)
     await message.reply(
         f"👁 <b>CURRENT START MESSAGE</b>:\n\n"
@@ -260,13 +368,17 @@ async def bulk_cmd(client: Client, message: Message):
         "2. Format each line as:\n"
         "<code>Anime Name | Image URL | Download Link | Description</code>\n\n"
         "3. Send the file to this bot\n\n"
-        "⚠️ <b>Note:</b> Use <code>|</code> as separator (pipe symbol)\n"
+        "⚠️ <b>Note:</b> Use <code>|</code> as separator\n"
         "<b>Example:</b>\n"
-        "<code>Solo Leveling | https://catbox.moe/abc.jpg | https://t.me/joinchat/xxx | Best anime ever</code>"
+        "<code>Solo Leveling | https://catbox.moe/abc.jpg | https://t.me/xxx | Best anime</code>"
     )
 
 @bot.on_message(filters.command("list") & admin_filter & filters.private)
 async def list_cmd(client: Client, message: Message):
+    """List all anime"""
+    global db
+    db = load_db()  # Reload
+    
     animes = db.get("animes", {})
     if not animes:
         await message.reply("📭 <b>Database is empty!</b>")
@@ -278,10 +390,10 @@ async def list_cmd(client: Client, message: Message):
     
     for i in range(0, total, chunk_size):
         chunk = items[i:i + chunk_size]
-        text = f"📚 <b>DATABASE LIST</b> (Page {i//chunk_size + 1}/{(total-1)//chunk_size + 1})\n\n"
+        text = f"📚 <b>DATABASE LIST</b> ({i+1}-{min(i+chunk_size, total)}/{total})\n\n"
         
         for name, data in chunk:
-            desc = data.get('desc', 'No desc')[:50]
+            desc = data.get('desc', 'No desc')[:40]
             text += f"• <b>{name.upper()}</b>\n  └ <i>{desc}...</i>\n\n"
         
         await message.reply(text, disable_web_page_preview=True)
@@ -291,7 +403,7 @@ async def list_cmd(client: Client, message: Message):
 async def admin_init(client: Client, message: Message):
     mode = "ADD" if "add" in message.text.lower() else "EDIT"
     admin_states[message.from_user.id] = {"step": "NAME", "mode": mode}
-    await message.reply(f"🚀 <b>ENTRY {mode} INITIATED</b>\n\nStep 1: Please enter the <b>Anime Name</b>:")
+    await message.reply(f"🚀 <b>ENTRY {mode} INITIATED</b>\n\nStep 1: Send <b>Anime Name</b>:")
 
 @bot.on_message(filters.command("broadcast") & admin_filter & filters.private)
 async def broadcast_cmd(client: Client, message: Message):
@@ -299,7 +411,7 @@ async def broadcast_cmd(client: Client, message: Message):
         await message.reply("❌ Reply to a message to broadcast it.")
         return
     
-    confirm = await message.reply("📡 <b>Global Broadcast Started...</b>")
+    confirm = await message.reply("📡 <b>Broadcast Started...</b>")
     count, deleted = 0, 0
     
     for user_id in db.get("users", []):
@@ -310,12 +422,12 @@ async def broadcast_cmd(client: Client, message: Message):
         except errors.UserIsBlocked:
             deleted += 1
         except Exception as e:
-            logger.error(f"Broadcast error for {user_id}: {e}")
+            logger.error(f"Broadcast error: {e}")
     
     await confirm.edit(
-        f"📢 <b>Broadcast Finished!</b>\n\n"
+        f"📢 <b>Broadcast Complete!</b>\n\n"
         f"✅ Delivered: <code>{count}</code>\n"
-        f"🚫 Blocked/Failed: <code>{deleted}</code>"
+        f"🚫 Failed: <code>{deleted}</code>"
     )
 
 @bot.on_message(filters.command("cancel") & (filters.private | filters.group))
@@ -323,30 +435,25 @@ async def cancel_task(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in admin_states:
         del admin_states[user_id]
-        await message.reply("✅ <b>Current task cancelled.</b>")
+        await message.reply("✅ <b>Task cancelled.</b>")
     else:
-        await message.reply("ℹ️ No active task to cancel.")
+        await message.reply("ℹ️ No active task.")
 
-# ✅ DOCUMENT HANDLER (BULK UPLOAD) - PRIVATE ONLY
+# ✅ DOCUMENT HANDLER (BULK UPLOAD)
 @bot.on_message(filters.document & filters.private)
 async def document_handler(client: Client, message: Message):
-    """Handle document uploads - especially for bulk upload"""
+    """Handle bulk upload"""
     user_id = message.from_user.id
-    
-    # Only admin can bulk upload
     if user_id != ADMIN_ID:
         return
     
-    # Check if it's a .txt file
     if not message.document.file_name.endswith(".txt"):
-        await message.reply("❌ Only <code>.txt</code> files are supported for bulk upload.")
         return
     
     msg = await message.reply("⏳ <b>Processing Bulk File...</b>")
     
     try:
         file_path = await message.download()
-        logger.info(f"Downloaded bulk file: {file_path}")
         
         count = 0
         errors_list = []
@@ -360,94 +467,92 @@ async def document_handler(client: Client, message: Message):
                 continue
                 
             if "|" not in line:
-                errors_list.append(f"Line {line_num}: No separator found")
+                errors_list.append(f"Line {line_num}: No | found")
                 continue
             
             try:
                 parts = line.split("|")
                 if len(parts) < 4:
-                    errors_list.append(f"Line {line_num}: Incomplete data")
+                    errors_list.append(f"Line {line_num}: Incomplete")
                     continue
                 
-                anime_name = parts[0].strip()
-                img_url = parts[1].strip()
-                link = parts[2].strip()
-                desc = parts[3].strip()
+                name, img, link, desc = [p.strip() for p in parts[:4]]
                 
-                if not all([anime_name, img_url, link]):
-                    errors_list.append(f"Line {line_num}: Missing required fields")
+                if not all([name, img, link]):
+                    errors_list.append(f"Line {line_num}: Missing fields")
                     continue
                 
-                db["animes"][anime_name.lower()] = {
-                    "img": img_url,
-                    "link": link,
-                    "desc": desc
-                }
+                db["animes"][name.lower()] = {"img": img, "link": link, "desc": desc}
                 count += 1
-                logger.info(f"Added anime: {anime_name}")
                 
             except Exception as e:
                 errors_list.append(f"Line {line_num}: {str(e)}")
-                continue
         
         save_db(db)
         
         if os.path.exists(file_path):
             os.remove(file_path)
         
-        result_text = f"✅ <b>Bulk Update Complete!</b>\n\nAdded <code>{count}</code> new records to the database."
-        
+        result = f"✅ <b>Bulk Complete!</b>\n\nAdded: <code>{count}</code>"
         if errors_list:
-            error_text = "\n".join(errors_list[:10])
-            if len(errors_list) > 10:
-                error_text += f"\n... and {len(errors_list) - 10} more errors"
-            result_text += f"\n\n⚠️ <b>Errors:</b>\n<pre>{error_text}</pre>"
+            result += f"\n⚠️ Errors: <code>{len(errors_list)}</code>"
         
-        await msg.edit(result_text)
-        logger.info(f"Bulk upload complete: {count} added, {len(errors_list)} errors")
+        await msg.edit(result)
         
     except Exception as e:
-        logger.error(f"Bulk upload error: {e}")
-        await msg.edit(f"❌ <b>Error processing file:</b>\n<code>{str(e)}</code>")
+        logger.error(f"Bulk error: {e}")
+        await msg.edit(f"❌ <b>Error:</b> <code>{str(e)}</code>")
 
-# ✅ MESSAGE HANDLER (TEXT ONLY) - PRIVATE & GROUP
-COMMANDS_LIST = ["start", "help", "report", "stats", "set_start_img", "set_start_msg", "view_start_msg", "bulk", "list", "add_ani", "edit_ani", "broadcast", "cancel"]
+# ✅ MESSAGE HANDLER (TEXT & ADMIN STATES)
+COMMANDS_LIST = ["start", "help", "report", "stats", "set_start_img", "set_start_msg", 
+                 "view_start_msg", "view_start_img", "bulk", "list", "add_ani", "edit_ani", 
+                 "broadcast", "cancel"]
 
 @bot.on_message(filters.text & (filters.private | filters.group) & ~filters.command(COMMANDS_LIST))
 async def message_handler(client: Client, message: Message):
+    """Handle text messages and admin states"""
+    global db
+    
     user_id = message.from_user.id
     raw_text = get_text(message)
     lower_text = raw_text.lower()
     
-    if not raw_text or raw_text.startswith('/'):
+    if not raw_text:
         return
     
     # Cancel check
     if lower_text == "cancel" and user_id in admin_states:
         del admin_states[user_id]
-        await message.reply("✅ <b>Task cancelled.</b>")
+        await message.reply("✅ <b>Cancelled.</b>")
         return
     
-    # Admin state handling (PRIVATE ONLY)
+    # ✅ ADMIN STATES (Private only)
     if user_id in admin_states and message.chat.type == "private":
         state = admin_states[user_id]
         step = state.get("step")
         
-        # SET START IMAGE
+        # SET START IMAGE (Interactive mode)
         if step == "SET_START_IMG":
+            if not raw_text.startswith(("http://", "https://")):
+                await message.reply("❌ Invalid URL. Must start with http:// or https://")
+                return
+            
             db["settings"]["start_img"] = raw_text
             save_db(db)
             del admin_states[user_id]
-            await message.reply("✅ <b>Start image updated successfully!</b>")
+            
+            await message.reply(
+                f"✅ <b>Start image updated!</b>\n\n"
+                f"URL: <code>{raw_text}</code>\n"
+                f"Use /view_start_img to verify."
+            )
             return
         
         # SET START MESSAGE
         if step == "SET_START_MSG":
             preview_text = (
-                f"👁 <b>PREVIEW:</b>\n\n"
-                f"{raw_text}\n\n"
-                f"Reply with <code>yes</code> to save, or send new text to edit again.\n"
-                f"Send <code>cancel</code> to abort."
+                f"👁 <b>PREVIEW:</b>\n\n{raw_text}\n\n"
+                f"Reply <code>yes</code> to save, or send new text."
             )
             state["pending_msg"] = raw_text
             state["step"] = "CONFIRM_START_MSG"
@@ -460,33 +565,31 @@ async def message_handler(client: Client, message: Message):
                 db["settings"]["start_msg"] = state["pending_msg"]
                 save_db(db)
                 del admin_states[user_id]
-                await message.reply("✅ <b>Start message updated successfully!</b>")
+                await message.reply("✅ <b>Start message saved!</b>")
             else:
                 state["pending_msg"] = raw_text
-                preview_text = (
-                    f"👁 <b>UPDATED PREVIEW:</b>\n\n"
-                    f"{raw_text}\n\n"
-                    f"Reply with <code>yes</code> to save, or send new text to edit again."
+                await message.reply(
+                    f"👁 <b>UPDATED PREVIEW:</b>\n\n{raw_text}\n\n"
+                    f"Reply <code>yes</code> to save."
                 )
-                await message.reply(preview_text, disable_web_page_preview=True)
             return
         
-        # ADD/EDIT ANIME FLOW
+        # ADD/EDIT ANIME
         if state.get("mode") in ["ADD", "EDIT"]:
             if step == "NAME":
                 state["name"] = lower_text
                 state["step"] = "IMG"
-                await message.reply("🔗 <b>Step 2:</b> Send the <b>Image URL</b> (Catbox/Telegraph):")
+                await message.reply("🔗 <b>Step 2:</b> Send <b>Image URL</b>:")
             
             elif step == "IMG":
                 state["img"] = raw_text
                 state["step"] = "LINK"
-                await message.reply("📥 <b>Step 3:</b> Send the <b>Download/Join Link</b> (Case Sensitive):")
+                await message.reply("📥 <b>Step 3:</b> Send <b>Download Link</b>:")
             
             elif step == "LINK":
                 state["link"] = raw_text
                 state["step"] = "DESC"
-                await message.reply("📝 <b>Step 4:</b> Send a short <b>Synopsis/Description</b>:")
+                await message.reply("📝 <b>Step 4:</b> Send <b>Description</b>:")
             
             elif step == "DESC":
                 db["animes"][state["name"]] = {
@@ -496,10 +599,11 @@ async def message_handler(client: Client, message: Message):
                 }
                 save_db(db)
                 del admin_states[user_id]
-                await message.reply(f"🎯 <b>SUCCESS!</b>\n<code>{state['name'].upper()}</code> is now live in the database.")
+                await message.reply(f"🎯 <b>SUCCESS!</b> <code>{state['name'].upper()}</code> added!")
         return
     
-    # Smart Search (PRIVATE & GROUP)
+    # ✅ SMART SEARCH (Private & Group)
+    db = load_db()  # Reload for latest data
     anime_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
     
     for name in anime_keys:
@@ -515,21 +619,15 @@ async def message_handler(client: Client, message: Message):
             )
             
             try:
-                await message.reply_photo(
-                    photo=data['img'],
-                    caption=caption,
-                    reply_markup=buttons
-                )
-            except Exception as e:
-                await message.reply(
-                    f"⚠️ <b>Image Error, sending text only.</b>\n\n{caption}",
-                    reply_markup=buttons,
-                    disable_web_page_preview=True
-                )
+                await message.reply_photo(photo=data['img'], caption=caption, reply_markup=buttons)
+            except:
+                await message.reply(f"⚠️ <b>{name.upper()}</b>\n\n{caption}", reply_markup=buttons)
+            
             add_user_to_db(user_id)
             return
 
 # --- RUN BOT ---
 if __name__ == "__main__":
-    print("💎 Kenshin Pro Version with Original UI is Online!")
+    print("💎 Kenshin Pro with Persistent Data is Online!")
+    print(f"💾 Database: {DB_FILE}")
     bot.run()
