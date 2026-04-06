@@ -18,6 +18,7 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").replace("@", "")
 
 # File Names & Links
 DB_FILE = "kenshin_data.json"
@@ -25,7 +26,6 @@ DEFAULT_START_IMAGE = "https://files.catbox.moe/v4oy6s.jpg"
 SUPPORT_GROUP = "https://t.me/KENSHIN_ANIME_CHAT"
 CHANNEL_LINK = "https://t.me/KENSHIN_ANIME"
 OWNER_USERNAME = "@KENSHIN_ANIME_OWNER"
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "KENSHIN_ANIME_SEARCH_BOT")  # Set your bot username
 
 # Default start message
 DEFAULT_START_MSG = (
@@ -91,24 +91,19 @@ async def is_admin(_, __, message: Message):
 
 admin_filter = filters.create(is_admin)
 
-def get_text_from_message(message: Message) -> str:
-    """Extract text from message or caption"""
-    if message.text:
-        return message.text
-    if message.caption:
-        return message.caption
-    return ""
-
-def remove_bot_mention(text: str) -> str:
-    """Remove @bot_username from text"""
-    return text.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.lower()}", "").strip()
+def get_text(message: Message) -> str:
+    """Get text from message or caption"""
+    text = message.text or message.caption or ""
+    # Remove bot mention in groups
+    if BOT_USERNAME and message.chat.type != "private":
+        text = text.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.lower()}", "")
+    return text.strip()
 
 # --- COMMANDS (PRIVATE & GROUP) ---
 
 @bot.on_message(filters.command("start") & (filters.private | filters.group))
 async def start_cmd(client: Client, message: Message):
     user_id = message.from_user.id
-    chat_id = message.chat.id
     add_user_to_db(user_id)
     
     start_img = db.get("settings", {}).get("start_img", DEFAULT_START_IMAGE)
@@ -124,8 +119,13 @@ async def start_cmd(client: Client, message: Message):
         if message.chat.type == "private":
             await message.reply_photo(photo=start_img, caption=start_msg, reply_markup=buttons)
         else:
-            # In group, send without buttons or with different text
-            await message.reply(f"👋 <b>Hello!</b> I'm Kenshin Anime Bot!\n\nI work in groups too! Just type any anime name and I'll find it for you.\n\nUse me in DM for better experience: @{BOT_USERNAME}")
+            # In group, send text only with mention
+            await message.reply(
+                f"👋 <b>Hey {message.from_user.first_name}!</b>\n\n"
+                f"I'm Kenshin Anime Bot! 🍿\n"
+                f"Type any anime name and I'll find it for you!\n\n"
+                f"<i>Tip: Use me in DM for full features → @{BOT_USERNAME or 'Bot'}</i>"
+            )
     except Exception as e:
         logger.error(f"Start error: {e}")
         await message.reply("👋 Hello! I'm Kenshin Anime Bot! Type any anime name to search.")
@@ -154,8 +154,6 @@ async def help_cmd(client: Client, message: Message):
             "• <code>/broadcast</code> - Global announcement\n"
             "• <code>/cancel</code> - Abort ongoing setup"
         )
-    
-    # In group, reply to message so user sees it
     await message.reply(help_text)
 
 @bot.on_message(filters.command("report") & (filters.private | filters.group))
@@ -189,7 +187,7 @@ async def report_cmd(client: Client, message: Message):
         logger.error(f"Report forwarding failed: {e}")
         await message.reply("❌ Failed to send report. Please contact admin directly.")
 
-# --- ADMIN COMMANDS (PRIVATE ONLY - SECURITY) ---
+# --- ADMIN COMMANDS (PRIVATE ONLY) ---
 
 @bot.on_message(filters.command("stats") & admin_filter & filters.private)
 async def stats_cmd(client: Client, message: Message):
@@ -403,20 +401,16 @@ async def document_handler(client: Client, message: Message):
         await msg.edit(f"❌ <b>Error processing file:</b>\n<code>{str(e)}</code>")
 
 # ✅ MESSAGE HANDLER (TEXT ONLY) - PRIVATE & GROUP
-@bot.on_message(filters.text & (filters.private | filters.group) & ~filters.command(["start", "help", "report", "stats", "set_start_img", "set_start_msg", "view_start_msg", "bulk", "list", "add_ani", "edit_ani", "broadcast", "cancel"]))
+COMMANDS_LIST = ["start", "help", "report", "stats", "set_start_img", "set_start_msg", "view_start_msg", "bulk", "list", "add_ani", "edit_ani", "broadcast", "cancel"]
+
+@bot.on_message(filters.text & (filters.private | filters.group) & ~filters.command(COMMANDS_LIST))
 async def message_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    raw_text = get_text_from_message(message)
-    
-    # Remove bot mention if in group
-    if message.chat.type != "private":
-        raw_text = remove_bot_mention(raw_text)
-    
-    raw_text = raw_text.strip()
+    raw_text = get_text(message)
     lower_text = raw_text.lower()
     
     # Ignore empty messages
-    if not raw_text:
+    if not raw_text or raw_text.startswith('/'):
         return
     
     # Cancel check
@@ -426,7 +420,7 @@ async def message_handler(client: Client, message: Message):
         return
     
     # Admin state handling (PRIVATE ONLY)
-    if user_id in admin_states and message.chat.type == "private" and not raw_text.startswith('/'):
+    if user_id in admin_states and message.chat.type == "private":
         state = admin_states[user_id]
         step = state.get("step")
         
@@ -497,35 +491,34 @@ async def message_handler(client: Client, message: Message):
         return
     
     # Smart Search (PRIVATE & GROUP)
-    if not raw_text.startswith('/'):
-        anime_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
-        
-        for name in anime_keys:
-            if name in lower_text:
-                data = db["animes"][name]
-                buttons = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=data['link'])]
-                ])
-                caption = (
-                    f"🎬 <b>ANIME FOUND: {name.upper()}</b>\n\n"
-                    f"📖 <b>SYNOPSIS:</b>\n<blockquote>{data['desc']}</blockquote>\n\n"
-                    f"✨ <b>Channel:</b> @KENSHIN_ANIME"
+    anime_keys = sorted(db.get("animes", {}).keys(), key=len, reverse=True)
+    
+    for name in anime_keys:
+        if name in lower_text:
+            data = db["animes"][name]
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=data['link'])]
+            ])
+            caption = (
+                f"🎬 <b>ANIME FOUND: {name.upper()}</b>\n\n"
+                f"📖 <b>SYNOPSIS:</b>\n<blockquote>{data['desc']}</blockquote>\n\n"
+                f"✨ <b>Channel:</b> @KENSHIN_ANIME"
+            )
+            
+            try:
+                await message.reply_photo(
+                    photo=data['img'],
+                    caption=caption,
+                    reply_markup=buttons
                 )
-                
-                try:
-                    await message.reply_photo(
-                        photo=data['img'],
-                        caption=caption,
-                        reply_markup=buttons
-                    )
-                except Exception as e:
-                    await message.reply(
-                        f"⚠️ <b>Image Error, sending text only.</b>\n\n{caption}",
-                        reply_markup=buttons,
-                        disable_web_page_preview=True
-                    )
-                add_user_to_db(user_id)
-                return
+            except Exception as e:
+                await message.reply(
+                    f"⚠️ <b>Image Error, sending text only.</b>\n\n{caption}",
+                    reply_markup=buttons,
+                    disable_web_page_preview=True
+                )
+            add_user_to_db(user_id)
+            return
 
 # --- RUN BOT ---
 if __name__ == "__main__":
