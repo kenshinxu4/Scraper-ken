@@ -27,7 +27,7 @@ SUPPORT_GROUP = "https://t.me/KENSHIN_ANIME_CHAT"
 CHANNEL_LINK = "https://t.me/KENSHIN_ANIME"
 OWNER_USERNAME = "@KENSHIN_ANIME_OWNER"
 
-# Default start message
+# Default start message (ORIGINAL FORMAT)
 DEFAULT_START_MSG = (
     "🌸 <b>Welcome to KENSHIN ANIME Search!</b> 🌸\n\n"
     "<blockquote>Official bot of ⚜️ @KENSHIN_ANIME ⚜️</blockquote>\n\n"
@@ -99,10 +99,11 @@ def get_text(message: Message) -> str:
         text = text.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.lower()}", "")
     return text.strip()
 
-# --- COMMANDS (PRIVATE & GROUP) ---
+# --- COMMANDS ---
 
-@bot.on_message(filters.command("start") & (filters.private | filters.group))
-async def start_cmd(client: Client, message: Message):
+@bot.on_message(filters.command("start") & filters.private)
+async def start_cmd_private(client: Client, message: Message):
+    """ORIGINAL UI - Private chat only"""
     user_id = message.from_user.id
     add_user_to_db(user_id)
     
@@ -116,19 +117,30 @@ async def start_cmd(client: Client, message: Message):
     ])
     
     try:
-        if message.chat.type == "private":
-            await message.reply_photo(photo=start_img, caption=start_msg, reply_markup=buttons)
-        else:
-            # In group, send text only with mention
-            await message.reply(
-                f"👋 <b>Hey {message.from_user.first_name}!</b>\n\n"
-                f"I'm Kenshin Anime Bot! 🍿\n"
-                f"Type any anime name and I'll find it for you!\n\n"
-                f"<i>Tip: Use me in DM for full features → @{BOT_USERNAME or 'Bot'}</i>"
-            )
+        # ORIGINAL: Send photo with caption and buttons
+        await message.reply_photo(
+            photo=start_img,
+            caption=start_msg,
+            reply_markup=buttons
+        )
     except Exception as e:
-        logger.error(f"Start error: {e}")
-        await message.reply("👋 Hello! I'm Kenshin Anime Bot! Type any anime name to search.")
+        logger.error(f"Start photo error: {e}")
+        # Fallback to text
+        await message.reply(
+            text=start_msg,
+            reply_markup=buttons,
+            disable_web_page_preview=True
+        )
+
+@bot.on_message(filters.command("start") & filters.group)
+async def start_cmd_group(client: Client, message: Message):
+    """Simple version for groups"""
+    await message.reply(
+        f"👋 <b>Hey {message.from_user.first_name}!</b>\n\n"
+        f"I'm Kenshin Anime Bot! 🍿\n"
+        f"Type any anime name and I'll find it for you!\n\n"
+        f"<i>Tip: Use me in DM for full experience → @{BOT_USERNAME or 'Bot'}</i>"
+    )
 
 @bot.on_message(filters.command("help") & (filters.private | filters.group))
 async def help_cmd(client: Client, message: Message):
@@ -333,11 +345,9 @@ async def document_handler(client: Client, message: Message):
     msg = await message.reply("⏳ <b>Processing Bulk File...</b>")
     
     try:
-        # Download file
         file_path = await message.download()
         logger.info(f"Downloaded bulk file: {file_path}")
         
-        # Read and process
         count = 0
         errors_list = []
         
@@ -409,7 +419,6 @@ async def message_handler(client: Client, message: Message):
     raw_text = get_text(message)
     lower_text = raw_text.lower()
     
-    # Ignore empty messages
     if not raw_text or raw_text.startswith('/'):
         return
     
@@ -522,5 +531,5 @@ async def message_handler(client: Client, message: Message):
 
 # --- RUN BOT ---
 if __name__ == "__main__":
-    print("💎 Kenshin Pro Version with Group Support is Online!")
+    print("💎 Kenshin Pro Version with Original UI is Online!")
     bot.run()
