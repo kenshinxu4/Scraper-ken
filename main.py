@@ -394,7 +394,7 @@ async def document_handler(client: Client, message: Message):
         await msg.edit(f"❌ <b>Error processing file:</b>\n<code>{str(e)}</code>")
 
 # --- MESSAGE HANDLER (TEXT ONLY) ---
-@bot.on_message(filters.private & filters.text & ~filters.command)
+@bot.on_message(filters.private & filters.text & ~filters.command())
 async def message_handler(client: Client, message: Message):
     user_id = message.from_user.id
     raw_text = message.text.strip()
