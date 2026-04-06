@@ -613,9 +613,9 @@ async def message_handler(client: Client, message: Message):
                 [InlineKeyboardButton("🚀 DOWNLOAD / WATCH NOW 🚀", url=data['link'])]
             ])
             caption = (
-                f"🎬 <b>ANIME:✨ {name.upper()} ✨</b>\n\n"
-                f"📖 <b>SYNOPSIS:</b>\n<b><blockquote>{data['desc']}</blockquote></b>\n\n"
-                f"✨ <b>FOR MORE JOIN:</b><b><blockquote>[@KENSHIN_ANIME & @MANWHA_VERSE]</blockquote></b>"
+                f"<b>✨ {name.upper()} ✨</b>\n\n"
+                f"📖 <b>SYNOPSIS:</b><b><blockquote>{data['desc']}</blockquote></b>\n\n"
+                f"✨ <b><blockquote>FOR MORE JOIN:</b><b>[@KENSHIN_ANIME & @MANWHA_VERSE]</blockquote></b>"
             )
             
             try:
