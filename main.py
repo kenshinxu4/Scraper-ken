@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║           🔥 KENSHIN ANIME BOT - FIXED EDITION v4.3 🔥                         ║
-║              Edit Fixed | Group Silent | Private Only No-Match                 ║
+║           🔥 KENSHIN ANIME BOT - ULTIMATE EDITION v5.1 🔥                      ║
+║        TXT Bulk Upload | JSON | CSV | All Commands Fixed | Full Heavy           ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -11,12 +11,15 @@ import json
 import asyncio
 import logging
 import re
+import csv
+import io
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+from collections import Counter
 
 from pyrogram import Client, filters, errors, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from pyrogram.errors import UserIsBlocked
+from pyrogram.errors import UserIsBlocked, MessageNotModified
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -37,6 +40,7 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "").replace("@", "")
 
 # Paths
 DB_FILE = os.environ.get("DB_FILE", "/data/kenshin_data.json")
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "/data/backups")
 DEFAULT_START_IMAGE = "https://files.catbox.moe/v4oy6s.jpg"
 CHANNEL_LINK = "https://t.me/KENSHIN_ANIME"
 SUPPORT_GROUP = "https://t.me/KENSHIN_ANIME_CHAT"
@@ -57,6 +61,9 @@ class Database:
         db_dir = os.path.dirname(self.filepath)
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
+        # Ensure backup dir exists
+        if not os.path.exists(BACKUP_DIR):
+            os.makedirs(BACKUP_DIR, exist_ok=True)
     
     def _load(self):
         if os.path.exists(self.filepath):
@@ -74,6 +81,11 @@ class Database:
             "settings": {
                 "start_image": DEFAULT_START_IMAGE,
                 "start_message": None
+            },
+            "stats": {
+                "searches": 0,
+                "downloads": 0,
+                "added_at": datetime.now().isoformat()
             }
         }
         self.save()
@@ -131,9 +143,11 @@ class Database:
                 self.data["animes"][name_lower][field] = value
                 
                 if field == "aliases":
+                    # Remove old aliases
                     for alias, target in list(self.data.get("aliases", {}).items()):
                         if target == name_lower:
                             del self.data["aliases"][alias]
+                    # Add new aliases
                     for alias in value:
                         self.data["aliases"][alias.lower().strip()] = name_lower
                 
@@ -172,6 +186,125 @@ class Database:
     def set_setting(self, key: str, value: Any) -> bool:
         self.data["settings"][key] = value
         return self.save()
+    
+    def increment_stat(self, stat_name: str):
+        """Increment a stat counter"""
+        if "stats" not in self.data:
+            self.data["stats"] = {}
+        self.data["stats"][stat_name] = self.data["stats"].get(stat_name, 0) + 1
+        self.save()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get comprehensive stats"""
+        animes = self.get_all_animes()
+        total_animes = len(animes)
+        total_users = len(self.data.get("users", []))
+        total_aliases = len(self.data.get("aliases", {}))
+        
+        # Calculate total views
+        total_views = sum(a.get("views", 0) for a in animes.values())
+        
+        # Get most viewed animes
+        sorted_animes = sorted(
+            animes.items(), 
+            key=lambda x: x[1].get("views", 0), 
+            reverse=True
+        )[:10]
+        
+        # Get recently added
+        recent_animes = sorted(
+            animes.items(),
+            key=lambda x: x[1].get("added_at", ""),
+            reverse=True
+        )[:5]
+        
+        return {
+            "total_animes": total_animes,
+            "total_users": total_users,
+            "total_aliases": total_aliases,
+            "total_views": total_views,
+            "top_animes": sorted_animes,
+            "recent_animes": recent_animes,
+            "system_stats": self.data.get("stats", {})
+        }
+    
+    def export_to_json(self) -> str:
+        """Export database to JSON string"""
+        return json.dumps(self.data, indent=2, ensure_ascii=False)
+    
+    def export_to_csv(self) -> str:
+        """Export animes to CSV format"""
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        writer.writerow([
+            "Name", "Display Name", "Image URL", "Download Link", 
+            "Description", "Aliases", "Views", "Added At"
+        ])
+        
+        # Write data
+        for key, data in self.data.get("animes", {}).items():
+            writer.writerow([
+                key,
+                data.get("name_display", ""),
+                data.get("image_url", ""),
+                data.get("download_link", ""),
+                data.get("desc", ""),
+                "|".join(data.get("aliases", [])),
+                data.get("views", 0),
+                data.get("added_at", "")
+            ])
+        
+        return output.getvalue()
+    
+    def bulk_import(self, data_list: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        Bulk import animes from list of dicts
+        Returns: (success_count, fail_count)
+        """
+        success = 0
+        failed = 0
+        
+        for item in data_list:
+            try:
+                name = item.get("name") or item.get("name_display")
+                if not name:
+                    failed += 1
+                    continue
+                
+                # Check if exists
+                existing = self.get_anime(name)
+                if existing:
+                    # Update instead of skip
+                    self.update_anime_field(
+                        existing["_key"], 
+                        "download_link", 
+                        item.get("download_link", existing.get("download_link"))
+                    )
+                    success += 1
+                    continue
+                
+                anime_data = {
+                    "name_display": item.get("name_display", name),
+                    "image_url": item.get("image_url", DEFAULT_START_IMAGE),
+                    "download_link": item.get("download_link", ""),
+                    "desc": item.get("desc", "No description"),
+                    "aliases": item.get("aliases", []),
+                    "added_by": ADMIN_ID,
+                    "added_at": datetime.now().isoformat(),
+                    "views": 0
+                }
+                
+                if self.add_anime(name, anime_data):
+                    success += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                logger.error(f"Bulk import error: {e}")
+                failed += 1
+        
+        return success, failed
 
 db = Database(DB_FILE)
 
@@ -264,6 +397,47 @@ class SearchEngine:
                         break
         
         return best_match
+    
+    @staticmethod
+    def search_anime(query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search animes by query and return sorted results"""
+        if not query:
+            return []
+        
+        query_clean = SearchEngine.normalize(query)
+        animes = db.get_all_animes()
+        results = []
+        
+        for key, data in animes.items():
+            score = 0
+            name_display = data.get("name_display", key).lower()
+            aliases = [a.lower() for a in data.get("aliases", [])]
+            
+            # Exact match
+            if query_clean == name_display:
+                score = 100
+            # Starts with
+            elif name_display.startswith(query_clean):
+                score = 80
+            # Contains
+            elif query_clean in name_display:
+                score = 60
+            # Alias exact match
+            elif query_clean in aliases:
+                score = 50
+            # Alias contains
+            else:
+                for alias in aliases:
+                    if query_clean in alias:
+                        score = 40
+                        break
+            
+            if score > 0:
+                results.append({**data, "_key": key, "_score": score})
+        
+        # Sort by score descending
+        results.sort(key=lambda x: x["_score"], reverse=True)
+        return results[:limit]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILS
@@ -275,6 +449,14 @@ def clean_text(text: str, is_group: bool = False) -> str:
     if is_group and BOT_USERNAME:
         text = re.sub(rf"@{re.escape(BOT_USERNAME)}\b", "", text, flags=re.IGNORECASE)
     return ' '.join(text.split()).strip()
+
+def format_bytes(size):
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # USER COMMANDS
@@ -332,6 +514,8 @@ async def help_cmd(client, message):
         "🛠 <b>USER COMMANDS</b>\n\n"
         "• /start - Start the bot\n"
         "• /help - Show this menu\n"
+        "• /search &lt;name&gt; - Search anime by name\n"
+        "• /popular - Show most popular animes\n"
         "• /report &lt;msg&gt; - Report issue\n\n"
         "🔍 <b>HOW TO SEARCH:</b>\n"
         "Just type anime name anywhere in your message!\n"
@@ -349,12 +533,118 @@ async def help_cmd(client, message):
             "• /edit_ani - Edit anime\n"
             "• /delete_ani - Delete anime\n"
             "• /add_alias - Add alias to anime\n"
+            "• /list - List all animes\n"
+            "• /search - Advanced search\n"
+            "• /stats - Bot statistics\n"
+            "• /popular - Popular animes\n"
+            "• /db_export - Export database\n"
+            "• /bulk - Bulk import animes (JSON/CSV/TXT)\n"
+            "• /broadcast - Broadcast message\n"
             "• /set_start_img - Change banner\n"
             "• /set_start_msg - Edit welcome\n"
-            "• /list - List all animes\n"
-            "• /broadcast - Broadcast message\n"
             "• /cancel - Cancel operation"
         )
+    
+    await message.reply(text)
+
+@bot.on_message(filters.command("search"))
+async def search_cmd(client, message):
+    """Search command - works for both users and admins"""
+    if len(message.command) < 2:
+        await message.reply(
+            "🔍 <b>Usage:</b> <code>/search anime_name</code>\n\n"
+            "Example: <code>/search solo leveling</code>"
+        )
+        return
+    
+    query = " ".join(message.command[1:])
+    results = SearchEngine.search_anime(query, limit=10)
+    
+    if not results:
+        await message.reply(f"❌ No results found for '<code>{query}</code>'")
+        return
+    
+    text = f"🔍 <b>Search Results for '{query}':</b>\n\n"
+    
+    for i, anime in enumerate(results, 1):
+        display = anime.get("name_display", anime["_key"])
+        views = anime.get("views", 0)
+        desc = anime.get("desc", "No description")[:60]
+        aliases = anime.get("aliases", [])
+        
+        text += f"{i}. <b>{display}</b> 👁 {views}\n"
+        text += f"   <i>{desc}...</i>\n"
+        if aliases:
+            text += f"   🏷 <code>{', '.join(aliases[:3])}</code>\n"
+        text += "\n"
+    
+    # Add buttons for top 5 results
+    buttons = []
+    for anime in results[:5]:
+        display = anime.get("name_display", anime["_key"])
+        # Create a callback or just use the name for text search
+        buttons.append([InlineKeyboardButton(f"🎬 {display}", callback_data=f"get_{anime['_key']}")])
+    
+    if not buttons:
+        buttons = [[InlineKeyboardButton("🔍 Try Text Search", switch_inline_query=query)]]
+    
+    await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+@bot.on_message(filters.command("popular"))
+async def popular_cmd(client, message):
+    """Show most popular animes by views"""
+    stats = db.get_stats()
+    top_animes = stats.get("top_animes", [])
+    
+    if not top_animes:
+        await message.reply("📭 No anime data available yet!")
+        return
+    
+    text = "🔥 <b>POPULAR ANIMES</b> 🔥\n\n"
+    
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    
+    for i, (key, data) in enumerate(top_animes[:10]):
+        display = data.get("name_display", key)
+        views = data.get("views", 0)
+        desc = data.get("desc", "No description")[:50]
+        
+        text += f"{medals[i] if i < 10 else '•'} <b>{display}</b>\n"
+        text += f"   👁 <b>{views}</b> views | {desc}...\n\n"
+    
+    text += f"\n📊 Total Views: <b>{stats.get('total_views', 0)}</b>"
+    
+    await message.reply(text, disable_web_page_preview=True)
+
+@bot.on_message(filters.command("stats"))
+async def stats_cmd(client, message):
+    """Show bot statistics"""
+    is_admin = state.is_admin(message.from_user.id)
+    
+    stats = db.get_stats()
+    
+    text = (
+        "📊 <b>BOT STATISTICS</b> 📊\n\n"
+        f"📺 <b>Total Animes:</b> <code>{stats['total_animes']}</code>\n"
+        f"👥 <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
+        f"🏷 <b>Total Aliases:</b> <code>{stats['total_aliases']}</code>\n"
+        f"👁 <b>Total Views:</b> <code>{stats['total_views']}</code>\n\n"
+    )
+    
+    if is_admin:
+        sys_stats = stats.get("system_stats", {})
+        text += (
+            "⚙️ <b>System Stats:</b>\n"
+            f"🔍 Total Searches: <code>{sys_stats.get('searches', 0)}</code>\n"
+            f"⬇️ Total Downloads: <code>{sys_stats.get('downloads', 0)}</code>\n\n"
+        )
+        
+        # Recent additions
+        text += "🆕 <b>Recently Added:</b>\n"
+        for key, data in stats.get("recent_animes", [])[:5]:
+            display = data.get("name_display", key)
+            added = data.get("added_at", "Unknown")[:10]
+            text += f"• <b>{display}</b> ({added})\n"
     
     await message.reply(text)
 
@@ -381,7 +671,7 @@ async def report_cmd(client, message):
         await message.reply("❌ Failed to send report.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ADMIN COMMANDS - FIXED EDIT ANI
+# ADMIN COMMANDS - FIXED AND ENHANCED
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @bot.on_message(filters.command("add_ani") & filters.private)
@@ -596,10 +886,263 @@ async def list_cmd(client, message):
         for idx, (key, data) in enumerate(chunk, i+1):
             display = data.get("name_display", key)
             aliases = len(data.get("aliases", []))
-            text += f"<code>{idx}.</code> <b>{display}</b> 🏷{aliases}\n"
+            views = data.get("views", 0)
+            text += f"<code>{idx}.</code> <b>{display}</b> 👁{views} 🏷{aliases}\n"
         
         await message.reply(text, disable_web_page_preview=True)
         await asyncio.sleep(0.3)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIXED COMMANDS: /db_export, /bulk, /stats, /popular, /search
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@bot.on_message(filters.command("db_export") & filters.private)
+async def db_export_cmd(client, message):
+    """Export database as JSON or CSV"""
+    user_id = message.from_user.id
+    if not state.is_admin(user_id):
+        await message.reply("❌ <b>Access Denied!</b>")
+        return
+    
+    # Check if format specified
+    fmt = "json"  # default
+    if len(message.command) > 1:
+        fmt = message.command[1].lower()
+    
+    try:
+        if fmt == "csv":
+            # Export as CSV
+            csv_data = db.export_to_csv()
+            filename = f"kenshin_animes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            
+            # Send as document
+            file_obj = io.BytesIO(csv_data.encode('utf-8'))
+            file_obj.name = filename
+            
+            await message.reply_document(
+                document=file_obj,
+                caption=f"📊 <b>Database Export (CSV)</b>\n\n"
+                        f"📁 File: <code>{filename}</code>\n"
+                        f"📺 Animes: <code>{len(db.get_all_animes())}</code>\n"
+                        f"📅 Date: <code>{datetime.now().strftime('%Y-%m-%d %H:%M')}</code>"
+            )
+        else:
+            # Export as JSON
+            json_data = db.export_to_json()
+            filename = f"kenshin_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            
+            # Save backup file
+            backup_path = os.path.join(BACKUP_DIR, filename)
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(json_data)
+            
+            # Send as document
+            file_obj = io.BytesIO(json_data.encode('utf-8'))
+            file_obj.name = filename
+            
+            await message.reply_document(
+                document=file_obj,
+                caption=f"💾 <b>Database Export (JSON)</b>\n\n"
+                        f"📁 File: <code>{filename}</code>\n"
+                        f"📺 Animes: <code>{len(db.get_all_animes())}</code>\n"
+                        f"👥 Users: <code>{len(db.data.get('users', []))}</code>\n"
+                        f"💾 Backup saved to: <code>{backup_path}</code>"
+            )
+        
+        logger.info(f"Database exported by {user_id} in {fmt} format")
+        
+    except Exception as e:
+        logger.error(f"Export error: {e}")
+        await message.reply(f"❌ <b>Export failed:</b> <code>{str(e)}</code>")
+
+def parse_txt_bulk_upload(file_path: str) -> List[Dict[str, Any]]:
+    """
+    Parse TXT file with format:
+    Name | Image URL | Link | Description | Aliases
+    
+    Returns list of anime data dicts
+    """
+    imported_data = []
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    
+    for line_num, line in enumerate(lines, 1):
+        line = line.strip()
+        
+        # Skip empty lines and comments
+        if not line or line.startswith('#') or line.startswith('//'):
+            continue
+        
+        # Skip header line if it contains "Name" and "Image"
+        if 'name' in line.lower() and 'image' in line.lower() and '|' in line:
+            continue
+        
+        # Parse pipe-separated format
+        if '|' not in line:
+            logger.warning(f"Line {line_num}: No pipe separator found, skipping: {line[:50]}")
+            continue
+        
+        parts = [p.strip() for p in line.split('|')]
+        
+        # Must have at least 4 parts (Name, Image, Link, Description)
+        if len(parts) < 4:
+            logger.warning(f"Line {line_num}: Insufficient data (need 4-5 parts), skipping")
+            continue
+        
+        try:
+            anime = {
+                "name": parts[0],
+                "name_display": parts[0],
+                "image_url": parts[1] if parts[1] else DEFAULT_START_IMAGE,
+                "download_link": parts[2],
+                "desc": parts[3] if parts[3] else "No description",
+                "aliases": []
+            }
+            
+            # Parse aliases if present (5th column)
+            if len(parts) >= 5 and parts[4]:
+                # Split by comma for multiple aliases
+                aliases = [a.strip() for a in parts[4].split(',') if a.strip()]
+                anime["aliases"] = aliases
+            
+            imported_data.append(anime)
+            logger.info(f"Line {line_num}: Parsed '{anime['name']}' with {len(anime['aliases'])} aliases")
+            
+        except Exception as e:
+            logger.error(f"Line {line_num}: Parse error: {e}")
+            continue
+    
+    return imported_data
+
+@bot.on_message(filters.command("bulk") & filters.private)
+async def bulk_cmd(client, message):
+    """
+    Bulk import animes from JSON, CSV, or TXT file
+    Usage: Reply to a document with /bulk
+    """
+    user_id = message.from_user.id
+    if not state.is_admin(user_id):
+        await message.reply("❌ <b>Access Denied!</b>")
+        return
+    
+    # Check if replying to a document
+    if not message.reply_to_message or not message.reply_to_message.document:
+        await message.reply(
+            "📦 <b>BULK UPLOAD</b>\n\n"
+            "<b>Supported Formats:</b>\n\n"
+            "1️⃣ <b>TXT Format</b> (Easiest):\n"
+            "<pre>Name | Image URL | Link | Description | Aliases</pre>\n"
+            "<b>Example:</b>\n"
+            "<pre>Solo Leveling | https://img.com/solo.jpg | https://t.me/... | A weak hunter... | sl, solo lev\n"
+            "Jujutsu Kaisen | https://img.com/jjk.jpg | https://t.me/... | Sorcerers... | jjk, jujutsu</pre>\n\n"
+            "2️⃣ <b>JSON Format:</b>\n"
+            "<pre>[{\n"
+            '  \"name\": \"Solo Leveling\",\n'
+            '  \"image_url\": \"https://...\",\n'
+            '  \"download_link\": \"https://...\",\n'
+            '  \"desc\": \"Description\",\n'
+            '  \"aliases\": [\"sl\", \"solo lev\"]\n'
+            "}]</pre>\n\n"
+            "3️⃣ <b>CSV Format:</b>\n"
+            "<pre>Name,Image URL,Download Link,Description,Aliases\n"
+            "Solo Leveling,https://...,https://...,Desc,sl|solo lev</pre>\n\n"
+            "✏️ <b>How to use:</b> Send the file and reply with <code>/bulk</code>"
+        )
+        return
+    
+    document = message.reply_to_message.document
+    file_name = document.file_name.lower()
+    
+    # Download file
+    status_msg = await message.reply("⬇️ <b>Downloading file...</b>")
+    
+    try:
+        file_path = await message.reply_to_message.download()
+        await status_msg.edit_text("📊 <b>Processing data...</b>")
+        
+        imported_data = []
+        file_type = "unknown"
+        
+        # Process based on file type
+        if file_name.endswith('.txt'):
+            file_type = "TXT"
+            imported_data = parse_txt_bulk_upload(file_path)
+            
+        elif file_name.endswith('.json'):
+            file_type = "JSON"
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    imported_data = data
+                elif isinstance(data, dict) and "animes" in data:
+                    # Convert from database format
+                    for key, anime in data["animes"].items():
+                        anime["name"] = key
+                        imported_data.append(anime)
+                        
+        elif file_name.endswith('.csv'):
+            file_type = "CSV"
+            with open(file_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Convert CSV row to anime data
+                    anime = {
+                        "name": row.get("Name") or row.get("name"),
+                        "name_display": row.get("Display Name") or row.get("name_display"),
+                        "image_url": row.get("Image URL") or row.get("image_url", DEFAULT_START_IMAGE),
+                        "download_link": row.get("Download Link") or row.get("download_link"),
+                        "desc": row.get("Description") or row.get("desc", "No description"),
+                        "aliases": (row.get("Aliases") or row.get("aliases", "")).split("|") if "|" in str(row.get("Aliases") or row.get("aliases", "")) else [],
+                        "views": int(row.get("Views") or row.get("views", 0))
+                    }
+                    imported_data.append(anime)
+        else:
+            await status_msg.edit_text("❌ <b>Unsupported file format!</b>\nUse .txt, .json, or .csv")
+            os.remove(file_path)
+            return
+        
+        if not imported_data:
+            await status_msg.edit_text("❌ <b>No valid data found in file!</b>\n\nCheck format and try again.")
+            os.remove(file_path)
+            return
+        
+        await status_msg.edit_text(f"🔄 <b>Importing {len(imported_data)} animes from {file_type}...</b>")
+        
+        # Import data
+        success, failed = db.bulk_import(imported_data)
+        
+        # Cleanup
+        os.remove(file_path)
+        
+        # Send detailed result
+        result_text = (
+            f"✅ <b>BULK IMPORT COMPLETE</b>\n\n"
+            f"📁 <b>File Type:</b> <code>{file_type}</code>\n"
+            f"📊 <b>Total Processed:</b> <code>{len(imported_data)}</code>\n"
+            f"✅ <b>Success:</b> <code>{success}</code>\n"
+            f"❌ <b>Failed:</b> <code>{failed}</code>\n\n"
+            f"📺 <b>Total Animes in DB:</b> <code>{len(db.get_all_animes())}</code>"
+        )
+        
+        # If TXT format, show sample of what was imported
+        if file_type == "TXT" and success > 0:
+            sample = imported_data[:3]
+            result_text += "\n\n📋 <b>Sample Imports:</b>\n"
+            for anime in sample:
+                aliases_str = f" ({', '.join(anime['aliases'])})" if anime['aliases'] else ""
+                result_text += f"• <b>{anime['name']}</b>{aliases_str}\n"
+        
+        await status_msg.edit_text(result_text)
+        
+        logger.info(f"Bulk import by {user_id}: {success} success, {failed} failed from {file_type}")
+        
+    except Exception as e:
+        logger.error(f"Bulk import error: {e}")
+        await status_msg.edit_text(f"❌ <b>Import failed:</b> <code>{str(e)}</code>")
+        # Cleanup on error
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.remove(file_path)
 
 @bot.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_cmd(client, message):
@@ -658,6 +1201,9 @@ async def send_anime_result(message: Message, anime_data: Dict[str, Any]):
     # Add user
     db.add_user(message.from_user.id)
     
+    # Increment search stat
+    db.increment_stat("searches")
+    
     # YOUR EXACT CAPTION
     caption = (
         f"<blockquote>✨ <b>{display_name.upper()}</b> ✨</blockquote>\n\n"
@@ -678,6 +1224,8 @@ async def send_anime_result(message: Message, anime_data: Dict[str, Any]):
             caption=caption,
             reply_markup=buttons
         )
+        # Increment download stat (when button shown)
+        db.increment_stat("downloads")
     except Exception as e:
         logger.error(f"Photo error: {e}")
         await message.reply(caption, reply_markup=buttons)
@@ -973,8 +1521,8 @@ async def main_handler(client, message):
 
 if __name__ == "__main__":
     print("╔════════════════════════════════════════════════════════════════╗")
-    print("║     🔥 KENSHIN ANIME BOT v4.3 - FIXED 🔥                        ║")
-    print("║     Edit Fixed | Group Silent | Private No-Match                ║")
+    print("║     🔥 KENSHIN ANIME BOT v5.1 - ULTIMATE 🔥                    ║")
+    print("║     TXT Bulk Upload | JSON | CSV | All Fixed | Full Heavy      ║")
     print("╚════════════════════════════════════════════════════════════════╝")
     print(f"💾 Database: {DB_FILE}")
     print(f"👤 Admin ID: {ADMIN_ID}")
